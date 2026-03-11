@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "session_id": "session-golden-valid",
+  "intent_node_id": "intent-root",
+  "current_node_id": "prompt-2",
+  "state": "Active",
+  "nodes": [
+    {
+      "id": "intent-root",
+      "label": "intent",
+      "kind": "Intent",
+      "artifact_kind": null,
+      "status": "Accepted",
+      "parent_id": null,
+      "children_ids": [
+        "prompt-1"
+      ],
+      "input_node_ids": [],
+      "payload_ref": "intent.md"
+    },
+    {
+      "id": "prompt-1",
+      "label": "first prompt",
+      "kind": "Prompt",
+      "artifact_kind": null,
+      "status": "Accepted",
+      "parent_id": "intent-root",
+      "children_ids": [
+        "prompt-2",
+        "artifact-accepted",
+        "artifact-rejected",
+        "artifact-shared-context"
+      ],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1/prompt.md"
+    },
+    {
+      "id": "prompt-2",
+      "label": "continuation",
+      "kind": "Prompt",
+      "artifact_kind": null,
+      "status": "Accepted",
+      "parent_id": "prompt-1",
+      "children_ids": [],
+      "input_node_ids": [
+        "artifact-shared-context"
+      ],
+      "payload_ref": "prompts/prompt-2/prompt.md"
+    },
+    {
+      "id": "artifact-accepted",
+      "label": "accepted artifact",
+      "kind": "Artifact",
+      "artifact_kind": "Implementation",
+      "status": "Accepted",
+      "parent_id": "prompt-1",
+      "children_ids": [],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1/artifacts/artifact-accepted.md"
+    },
+    {
+      "id": "artifact-rejected",
+      "label": "rejected artifact",
+      "kind": "Artifact",
+      "artifact_kind": "Implementation",
+      "status": "Rejected",
+      "parent_id": "prompt-1",
+      "children_ids": [],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1/artifacts/artifact-rejected.md"
+    },
+    {
+      "id": "artifact-shared-context",
+      "label": "shared context",
+      "kind": "Artifact",
+      "artifact_kind": "Context",
+      "status": "Accepted",
+      "parent_id": "prompt-1",
+      "children_ids": [],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1/artifacts/artifact-shared-context.md"
+    }
+  ]
+}

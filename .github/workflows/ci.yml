@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  quality:
+    name: Fmt, Lint, Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust fmt check
+        run: cargo fmt --all -- --check
+
+      - name: Rust clippy check
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Rust test check
+        run: cargo test --workspace --all-features
