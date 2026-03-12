@@ -1105,6 +1105,7 @@ struct InteractiveTuiApp {
     input_dialog: Option<InteractiveTuiInputDialog>,
     preview: Option<InteractiveArtifactPreview>,
     stream_output_by_session: HashMap<String, String>,
+    output_scroll_from_bottom_by_session: HashMap<String, usize>,
     pending_provider_tasks: usize,
     worker_tx: Sender<InteractiveWorkerEvent>,
     worker_rx: Receiver<InteractiveWorkerEvent>,
@@ -1134,6 +1135,7 @@ impl InteractiveTuiApp {
             input_dialog: None,
             preview: None,
             stream_output_by_session: HashMap::new(),
+            output_scroll_from_bottom_by_session: HashMap::new(),
             pending_provider_tasks: 0,
             worker_tx,
             worker_rx,
@@ -1199,15 +1201,20 @@ impl InteractiveTuiApp {
             match event {
                 InteractiveWorkerEvent::StreamChunk { session_id, chunk } => {
                     self.stream_output_by_session
-                        .entry(session_id)
+                        .entry(session_id.clone())
                         .or_default()
                         .push_str(&chunk);
+                    self.output_scroll_from_bottom_by_session
+                        .entry(session_id)
+                        .or_insert(0);
                 }
                 InteractiveWorkerEvent::SessionTaskFinished {
                     session_id,
                     status_message,
                 } => {
                     self.pending_provider_tasks = self.pending_provider_tasks.saturating_sub(1);
+                    self.output_scroll_from_bottom_by_session
+                        .insert(session_id.clone(), 0);
                     self.refresh_session_summaries()?;
                     self.switch_to_session(session_id)?;
                     self.status_message = status_message;
@@ -1222,6 +1229,8 @@ impl InteractiveTuiApp {
                     if let Some(session_id) = session_id {
                         self.current_session_id = Some(session_id);
                         self.screen = InteractiveTuiScreen::SessionView;
+                        self.refresh_session_summaries()?;
+                        let _ = self.refresh_current_session();
                     }
                 }
             }
@@ -1369,27 +1378,35 @@ impl InteractiveTuiApp {
             body_layout[1],
         );
 
-        let session_stream_output = self
-            .current_session_id
-            .as_ref()
-            .and_then(|session_id| self.stream_output_by_session.get(session_id))
-            .cloned()
-            .unwrap_or_else(|| String::from("No provider output yet"));
+        let session_stream_output = self.current_session_output();
+        let output_scroll = resolve_output_scroll_offset(
+            &session_stream_output,
+            root_layout[2].height,
+            self.current_output_scroll_from_bottom(),
+        );
+        let output_title = if self.pending_provider_tasks > 0 {
+            format!("Current Session Output [{} waiting]", self.spinner_frame())
+        } else {
+            String::from("Current Session Output")
+        };
         frame.render_widget(
             Paragraph::new(session_stream_output)
                 .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .title("Current Session Output")
-                        .borders(Borders::ALL),
-                ),
+                .block(Block::default().title(output_title).borders(Borders::ALL))
+                .scroll((output_scroll, 0)),
             root_layout[2],
         );
 
+        let running_indicator = if self.pending_provider_tasks > 0 {
+            format!("{} ({})", self.pending_provider_tasks, self.spinner_frame())
+        } else {
+            String::from("0")
+        };
+
         frame.render_widget(
             Paragraph::new(format!(
-                "p: prompt | n: new intent | s: show artifact | a/r: accept/reject | c: complete | o: sessions | q: quit | running={}  [{}]",
-                self.pending_provider_tasks,
+                "p: prompt | n: new intent | s: show artifact | a/r: accept/reject | c: complete | [/]: output scroll | End: live tail | o: sessions | q: quit | running={}  [{}]",
+                running_indicator,
                 self.status_message
             ))
             .wrap(Wrap { trim: true })
@@ -1514,6 +1531,9 @@ impl InteractiveTuiApp {
             }
             KeyCode::Char('p') => self.open_input_dialog(InteractiveTuiInputKind::Prompt),
             KeyCode::Char('n') => self.open_input_dialog(InteractiveTuiInputKind::NewIntent),
+            KeyCode::Char('[') | KeyCode::PageUp => self.scroll_output_up(3),
+            KeyCode::Char(']') | KeyCode::PageDown => self.scroll_output_down(3),
+            KeyCode::End => self.follow_live_output(),
             KeyCode::Char('b') => {
                 self.status_message = String::from("Artifacts are visible in the right panel");
             }
@@ -1589,8 +1609,10 @@ impl InteractiveTuiApp {
 
         self.pending_provider_tasks += 1;
         let session_id = session_id.clone();
-        self.stream_output_by_session
-            .insert(session_id.clone(), String::new());
+        self.start_output_stream_for_session(
+            &session_id,
+            &format!("[prompt] {}", prompt.replace('\n', " ")),
+        );
         self.status_message = format!("Started prompt execution for '{session_id}'");
 
         let provider = self.provider;
@@ -1645,8 +1667,10 @@ impl InteractiveTuiApp {
         self.artifact_ids.clear();
         self.artifact_index = 0;
         self.screen = InteractiveTuiScreen::SessionView;
-        self.stream_output_by_session
-            .insert(session_id.clone(), String::new());
+        self.start_output_stream_for_session(
+            &session_id,
+            &format!("[intent] {}", intent.replace('\n', " ")),
+        );
         self.status_message = format!("Creating new session '{session_id}'");
 
         let provider = self.provider;
@@ -1818,6 +1842,9 @@ impl InteractiveTuiApp {
         self.screen = InteractiveTuiScreen::SessionView;
         self.preview = None;
         self.input_dialog = None;
+        self.output_scroll_from_bottom_by_session
+            .entry(session_id.clone())
+            .or_insert(0);
         self.refresh_current_session()?;
         self.status_message = format!("Loaded session '{session_id}'");
         Ok(())
@@ -1826,6 +1853,90 @@ impl InteractiveTuiApp {
     fn selected_artifact_id(&self) -> Option<&NodeId> {
         self.artifact_ids.get(self.artifact_index)
     }
+
+    fn current_session_output(&self) -> String {
+        self.current_session_id
+            .as_ref()
+            .and_then(|session_id| self.stream_output_by_session.get(session_id))
+            .cloned()
+            .unwrap_or_else(|| String::from("No provider output yet"))
+    }
+
+    fn current_output_scroll_from_bottom(&self) -> usize {
+        self.current_session_id
+            .as_ref()
+            .and_then(|session_id| self.output_scroll_from_bottom_by_session.get(session_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn scroll_output_up(&mut self, lines: usize) {
+        let Some(session_id) = self.current_session_id.clone() else {
+            return;
+        };
+
+        let scroll_from_bottom = self
+            .output_scroll_from_bottom_by_session
+            .entry(session_id)
+            .or_insert(0);
+        *scroll_from_bottom = scroll_from_bottom.saturating_add(lines);
+    }
+
+    fn scroll_output_down(&mut self, lines: usize) {
+        let Some(session_id) = self.current_session_id.clone() else {
+            return;
+        };
+
+        let scroll_from_bottom = self
+            .output_scroll_from_bottom_by_session
+            .entry(session_id)
+            .or_insert(0);
+        *scroll_from_bottom = scroll_from_bottom.saturating_sub(lines);
+    }
+
+    fn follow_live_output(&mut self) {
+        let Some(session_id) = self.current_session_id.clone() else {
+            return;
+        };
+        self.output_scroll_from_bottom_by_session
+            .insert(session_id, 0);
+    }
+
+    fn spinner_frame(&self) -> char {
+        const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+        let frame_index = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| {
+                ((duration.as_millis() / 125) % FRAMES.len() as u128) as usize
+            });
+        FRAMES[frame_index]
+    }
+
+    fn start_output_stream_for_session(&mut self, session_id: &str, header: &str) {
+        let output = self
+            .stream_output_by_session
+            .entry(session_id.to_string())
+            .or_default();
+        if !output.is_empty() {
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str("---\n");
+        }
+        output.push_str(header);
+        output.push('\n');
+        self.output_scroll_from_bottom_by_session
+            .insert(session_id.to_string(), 0);
+    }
+}
+
+fn resolve_output_scroll_offset(output: &str, panel_height: u16, scroll_from_bottom: usize) -> u16 {
+    let viewport_lines = usize::from(panel_height.saturating_sub(2)).max(1);
+    let total_lines = output.lines().count().max(1);
+    let max_scroll = total_lines.saturating_sub(viewport_lines);
+    let clamped_from_bottom = scroll_from_bottom.min(max_scroll);
+    let offset = max_scroll.saturating_sub(clamped_from_bottom);
+    offset.try_into().unwrap_or(u16::MAX)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -1904,13 +2015,6 @@ fn run_session_create_in_background(
     write_session_json(&session_dir, &session)
         .map_err(|err| AppError::from_io("write session json", err))?;
 
-    let suggestion = suggest_next_prompt_for_provider(provider, &session.thread_id)?;
-    if let Some(thread_id) = suggestion.thread_id.clone() {
-        session.thread_id = thread_id;
-    }
-    write_session_json(&session_dir, &session)
-        .map_err(|err| AppError::from_io("write session json", err))?;
-
     append_event(
         &session_dir,
         SessionEventKind::PromptAdded,
@@ -1925,20 +2029,46 @@ fn run_session_create_in_background(
         Some(generated.artifact_node_id.clone()),
         json!({"provider":provider, "prompt":intent_text, "thread_id":session.thread_id.clone()}),
     )?;
-    append_event(
-        &session_dir,
-        SessionEventKind::OrchestrationDecision,
-        &session.session_id,
-        Some(generated.prompt_node_id),
-        json!({
-            "stage":"suggest_next_prompt",
-            "next_prompt":suggestion.next_prompt.clone(),
-            "artifacts":suggestion.artifacts.clone(),
-            "thread_id":session.thread_id.clone()
-        }),
-    )?;
 
-    Ok(suggestion.next_prompt)
+    let suggested_next_prompt = match suggest_next_prompt_for_provider(provider, &session.thread_id)
+    {
+        Ok(suggestion) => {
+            if let Some(thread_id) = suggestion.thread_id.clone() {
+                session.thread_id = thread_id;
+            }
+            write_session_json(&session_dir, &session)
+                .map_err(|err| AppError::from_io("write session json", err))?;
+            append_event(
+                &session_dir,
+                SessionEventKind::OrchestrationDecision,
+                &session.session_id,
+                Some(generated.prompt_node_id),
+                json!({
+                    "stage":"suggest_next_prompt",
+                    "next_prompt":suggestion.next_prompt.clone(),
+                    "artifacts":suggestion.artifacts.clone(),
+                    "thread_id":session.thread_id.clone()
+                }),
+            )?;
+            suggestion.next_prompt
+        }
+        Err(err) => {
+            append_event(
+                &session_dir,
+                SessionEventKind::OrchestrationDecision,
+                &session.session_id,
+                Some(generated.prompt_node_id),
+                json!({
+                    "stage":"suggest_next_prompt_failed",
+                    "error": err.to_string(),
+                    "thread_id":session.thread_id.clone()
+                }),
+            )?;
+            String::from("<suggestion unavailable>")
+        }
+    };
+
+    Ok(suggested_next_prompt)
 }
 
 fn run_session_continue_in_background(
@@ -1980,13 +2110,6 @@ fn run_session_continue_in_background(
     write_session_json(&session_dir, &session)
         .map_err(|err| AppError::from_io("write session json", err))?;
 
-    let suggestion = suggest_next_prompt_for_provider(provider, &session.thread_id)?;
-    if let Some(thread_id) = suggestion.thread_id.clone() {
-        session.thread_id = thread_id;
-    }
-    write_session_json(&session_dir, &session)
-        .map_err(|err| AppError::from_io("write session json", err))?;
-
     append_event(
         &session_dir,
         SessionEventKind::PromptAdded,
@@ -2001,20 +2124,46 @@ fn run_session_continue_in_background(
         Some(generated.artifact_node_id.clone()),
         json!({"provider":provider, "prompt":prompt, "thread_id":session.thread_id.clone()}),
     )?;
-    append_event(
-        &session_dir,
-        SessionEventKind::OrchestrationDecision,
-        &session.session_id,
-        Some(generated.prompt_node_id),
-        json!({
-            "stage":"suggest_next_prompt",
-            "next_prompt":suggestion.next_prompt.clone(),
-            "artifacts":suggestion.artifacts.clone(),
-            "thread_id":session.thread_id.clone()
-        }),
-    )?;
 
-    Ok(suggestion.next_prompt)
+    let suggested_next_prompt = match suggest_next_prompt_for_provider(provider, &session.thread_id)
+    {
+        Ok(suggestion) => {
+            if let Some(thread_id) = suggestion.thread_id.clone() {
+                session.thread_id = thread_id;
+            }
+            write_session_json(&session_dir, &session)
+                .map_err(|err| AppError::from_io("write session json", err))?;
+            append_event(
+                &session_dir,
+                SessionEventKind::OrchestrationDecision,
+                &session.session_id,
+                Some(generated.prompt_node_id),
+                json!({
+                    "stage":"suggest_next_prompt",
+                    "next_prompt":suggestion.next_prompt.clone(),
+                    "artifacts":suggestion.artifacts.clone(),
+                    "thread_id":session.thread_id.clone()
+                }),
+            )?;
+            suggestion.next_prompt
+        }
+        Err(err) => {
+            append_event(
+                &session_dir,
+                SessionEventKind::OrchestrationDecision,
+                &session.session_id,
+                Some(generated.prompt_node_id),
+                json!({
+                    "stage":"suggest_next_prompt_failed",
+                    "error": err.to_string(),
+                    "thread_id":session.thread_id.clone()
+                }),
+            )?;
+            String::from("<suggestion unavailable>")
+        }
+    };
+
+    Ok(suggested_next_prompt)
 }
 
 fn execute_provider_prompt_streaming_with_callback(
@@ -2861,8 +3010,8 @@ mod tests {
 
     use super::{
         load_auto_resume_state, load_session_summaries, looks_like_amp_thread_id,
-        session_thread_id_requires_refresh, ArtifactCommand, Cli, Command, InterruptController,
-        ProviderCli, SessionCheckpoint, SessionCommand, SessionState,
+        resolve_output_scroll_offset, session_thread_id_requires_refresh, ArtifactCommand, Cli,
+        Command, InterruptController, ProviderCli, SessionCheckpoint, SessionCommand, SessionState,
     };
 
     #[test]
@@ -2995,6 +3144,24 @@ mod tests {
             ProviderCli::Echo,
             "thread-echo-123"
         ));
+    }
+
+    #[test]
+    fn output_scroll_defaults_to_live_tail() {
+        let output = "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\n";
+        let panel_height = 4; // 2 visible content rows after borders.
+
+        let scroll = resolve_output_scroll_offset(output, panel_height, 0);
+        assert_eq!(scroll, 4);
+    }
+
+    #[test]
+    fn output_scroll_from_bottom_moves_up_history() {
+        let output = "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\n";
+        let panel_height = 4; // 2 visible content rows after borders.
+
+        let scroll = resolve_output_scroll_offset(output, panel_height, 2);
+        assert_eq!(scroll, 2);
     }
 
     fn unique_test_dir(label: &str) -> std::path::PathBuf {

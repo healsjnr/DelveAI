@@ -25,9 +25,12 @@ The format follows Keep a Changelog principles and Semantic Versioning intent.
 7. Next-prompt suggestions are now provider-driven and thread-aware, using the session thread context.
 8. `session interactive` now runs on a ratatui-based terminal UI with session picker, in-session actions, and modal prompt/intent composition.
 9. Interactive prompt/intent execution now runs provider calls in background worker threads and streams output into a dedicated "Current Session Output" panel.
+10. Interactive "Current Session Output" now supports scrolling (`[`/`]` or PageUp/PageDown) and live-tail reset (`End`), with an in-panel spinner while provider tasks are running.
 
 ### Fixed
 1. AMP provider flows now refresh incompatible legacy session `thread_id` values before continue/auto execution so artifact generation and next-prompt suggestions always run through valid AMP threads.
+2. Interactive background prompt/intent runs no longer drop persisted artifacts when next-prompt suggestion generation fails; suggestion failure is now logged as metadata while the generated artifact remains saved.
+3. Interactive background task failures now refresh session state in the TUI so newly written artifacts remain visible after partial-run errors.
 
 ### Removed
 
