@@ -207,6 +207,10 @@ fn json_mode_and_exit_codes_are_script_friendly() {
         sessions_dir.to_str().expect("sessions path should be utf8"),
     ]);
     assert_eq!(missing_artifact.status.code(), Some(3));
+    let error_log = fs::read_to_string(sessions_dir.join("errors.log"))
+        .expect("error log should be created for command failures");
+    assert!(error_log.contains("context=command_error"));
+    assert!(error_log.contains("artifact-does-not-exist"));
 
     let completion = run_delve(&["completion", "--shell", "bash"]);
     assert_success(&completion);

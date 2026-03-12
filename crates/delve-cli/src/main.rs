@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -46,11 +46,13 @@ use serde_json::json;
 
 const DEFAULT_MAX_AUTO_STEPS: u32 = 5;
 const DEFAULT_REVIEW_CONFIDENCE_THRESHOLD: f32 = 0.6;
+const ERROR_LOG_FILE_NAME: &str = "errors.log";
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
+            append_error_log(&default_sessions_dir(), "cli_parse", &format!("{err}"));
             let code = if err.use_stderr() {
                 StableExitCode::Usage
             } else {
@@ -61,9 +63,11 @@ fn main() -> ExitCode {
         }
     };
 
+    let sessions_dir_for_logs = sessions_dir_for_cli(&cli);
     match run(cli) {
         Ok(()) => StableExitCode::Success.as_exit_code(),
         Err(err) => {
+            append_error_log(&sessions_dir_for_logs, "command_error", &format!("{err}"));
             if !matches!(err, AppError::Interrupted(_)) {
                 eprintln!("error: {err}");
             }
@@ -542,6 +546,50 @@ fn run(cli: Cli) -> Result<(), AppError> {
         Command::Artifact { command } => run_artifact(command, &runtime),
         Command::Completion(args) => run_completion(args),
     }
+}
+
+fn sessions_dir_for_cli(cli: &Cli) -> PathBuf {
+    let candidate = match &cli.command {
+        Command::Session { command } => match command {
+            SessionCommand::Create(args) => args.sessions_dir.clone(),
+            SessionCommand::Continue(args) => args.sessions_dir.clone(),
+            SessionCommand::Show(args) => args.sessions_dir.clone(),
+            SessionCommand::List(args) => args.sessions_dir.clone(),
+            SessionCommand::Complete(args) => args.sessions_dir.clone(),
+            SessionCommand::Interactive(args) => args.sessions_dir.clone(),
+            SessionCommand::Auto(args) => args.sessions_dir.clone(),
+        },
+        Command::Artifact { command } => match command {
+            ArtifactCommand::Show(args) => args.sessions_dir.clone(),
+            ArtifactCommand::Accept(args) => args.sessions_dir.clone(),
+            ArtifactCommand::Reject(args) => args.sessions_dir.clone(),
+        },
+        Command::Completion(_) => None,
+    };
+
+    candidate.unwrap_or_else(default_sessions_dir)
+}
+
+fn append_error_log(sessions_dir: &Path, context: &str, message: &str) {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+
+    if fs::create_dir_all(sessions_dir).is_err() {
+        return;
+    }
+
+    let log_path = sessions_dir.join(ERROR_LOG_FILE_NAME);
+    let mut file = match OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+
+    let sanitized_message = message.replace('\n', "\\n");
+    let _ = writeln!(
+        file,
+        "ts_ms={timestamp_ms} context={context} message={sanitized_message}"
+    );
 }
 
 fn run_completion(args: CompletionArgs) -> Result<(), AppError> {
@@ -1263,6 +1311,11 @@ impl InteractiveTuiApp {
                     error_message,
                 } => {
                     self.pending_provider_tasks = self.pending_provider_tasks.saturating_sub(1);
+                    let context = session_id.as_ref().map_or_else(
+                        || String::from("interactive_background_task"),
+                        |session_id| format!("interactive_background_task session={session_id}"),
+                    );
+                    append_error_log(&self.sessions_dir, &context, &error_message);
                     self.status_message =
                         format!("Background provider task failed: {error_message}");
                     if let Some(session_id) = session_id {
@@ -2210,6 +2263,11 @@ fn run_session_create_in_background(
             suggestion.next_prompt
         }
         Err(err) => {
+            append_error_log(
+                sessions_dir,
+                &format!("suggest_next_prompt_failed session={session_id}"),
+                &err.to_string(),
+            );
             append_event(
                 &session_dir,
                 SessionEventKind::OrchestrationDecision,
@@ -2305,6 +2363,11 @@ fn run_session_continue_in_background(
             suggestion.next_prompt
         }
         Err(err) => {
+            append_error_log(
+                sessions_dir,
+                &format!("suggest_next_prompt_failed session={session_id}"),
+                &err.to_string(),
+            );
             append_event(
                 &session_dir,
                 SessionEventKind::OrchestrationDecision,

@@ -28,6 +28,7 @@ The format follows Keep a Changelog principles and Semantic Versioning intent.
 10. Interactive "Current Session Output" now supports scrolling (`[`/`]` or PageUp/PageDown) and live-tail reset (`End`), with an in-panel spinner while provider tasks are running.
 11. Interactive session view now uses a navigable tree (↑/↓) with a dedicated viewer pane that shows metadata and payload text for the selected node.
 12. Interactive panes now support focus cycling with Tab/Shift+Tab, selected-pane highlighting, and pane-specific scrolling for Tree, Viewer, and Current Session Output.
+13. CLI error logging now writes command and interactive background-task failures to `errors.log` inside the active sessions directory.
 
 ### Fixed
 1. AMP provider flows now refresh incompatible legacy session `thread_id` values before continue/auto execution so artifact generation and next-prompt suggestions always run through valid AMP threads.
