@@ -23,6 +23,7 @@ The format follows Keep a Changelog principles and Semantic Versioning intent.
 5. Sessions now persist a single intent `thread_id`, and all prompts in that intent tree execute on the same provider thread.
 6. Amp provider now creates a new thread with `amp threads new` for intent creation and executes prompts with `amp threads continue <thread_id> -x`.
 7. Next-prompt suggestions are now provider-driven and thread-aware, using the session thread context.
+8. `session interactive` now runs on a ratatui-based terminal UI with session picker, in-session actions, and modal prompt/intent composition.
 
 ### Fixed
 1. AMP provider flows now refresh incompatible legacy session `thread_id` values before continue/auto execution so artifact generation and next-prompt suggestions always run through valid AMP threads.

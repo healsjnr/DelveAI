@@ -13,10 +13,12 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
+crossterm = "0.29"
 ctrlc = "3.4"
 delve-domain = { path = "../delve-domain" }
 delve-orchestrator = { path = "../delve-orchestrator" }
 delve-providers = { path = "../delve-providers" }
 delve-storage = { path = "../delve-storage" }
+ratatui = "0.29"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

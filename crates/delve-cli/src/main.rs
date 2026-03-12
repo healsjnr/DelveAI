@@ -9,10 +9,16 @@ use std::process;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use delve_domain::{
     ArtifactKind, NodeId, NodeKind, NodeStatus, SessionId, SessionNode, SessionState, SessionTree,
 };
@@ -27,6 +33,12 @@ use delve_storage::{
     read_session_events, read_session_json, session_file_path, write_session_checkpoint,
     write_session_json, SessionCheckpoint, SessionEvent, SessionEventKind,
 };
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::prelude::Terminal;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use serde::Serialize;
 use serde_json::json;
 
@@ -1025,108 +1037,653 @@ fn run_session_interactive(
     args: SessionInteractiveArgs,
     runtime: &RuntimeConfig,
 ) -> Result<(), AppError> {
+    if runtime.output_mode == OutputMode::Json {
+        return Err(AppError::InvalidState(String::from(
+            "interactive mode does not support --json",
+        )));
+    }
+
     let sessions_dir = args.sessions_dir.unwrap_or_else(default_sessions_dir);
-    let mut session_id = match args.session {
-        Some(session) => session,
-        None => match choose_interactive_session(&sessions_dir)? {
-            InteractiveSessionSelection::Existing(session_id) => session_id,
-            InteractiveSessionSelection::CreateNew => {
-                create_interactive_intent_session(args.provider, &sessions_dir, runtime)?
-            }
-        },
-    };
+    let mut app =
+        InteractiveTuiApp::new(args.provider, sessions_dir, runtime.clone(), args.session)?;
+    app.run()
+}
 
-    runtime.text_line(format!("Launching interactive session '{session_id}'"));
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveTuiScreen {
+    SessionPicker,
+    SessionView,
+}
 
-    loop {
-        let session_dir = sessions_dir.join(&session_id);
-        let session = read_session_json(&session_dir)
-            .map_err(|err| AppError::from_io("load session for interactive mode", err))?;
-        if !runtime.quiet {
-            println!();
-            println!("Session {} [{:?}]", session.session_id, session.state);
-            println!("Tree:");
-            for line in render_tree_lines(&session) {
-                println!("{line}");
-            }
-            println!("Actions: [p]rompt [n]ew intent [b]rowse artifacts [s]how artifact [a]ccept [r]eject [c]omplete [q]uit");
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractiveTuiInputKind {
+    Prompt,
+    NewIntent,
+}
+
+#[derive(Clone, Debug)]
+struct InteractiveTuiInputDialog {
+    kind: InteractiveTuiInputKind,
+    text: String,
+}
+
+#[derive(Clone, Debug)]
+struct InteractiveArtifactPreview {
+    title: String,
+    body: String,
+}
+
+struct InteractiveTuiApp {
+    provider: ProviderCli,
+    sessions_dir: PathBuf,
+    runtime: RuntimeConfig,
+    screen: InteractiveTuiScreen,
+    session_summaries: Vec<SessionSummary>,
+    picker_index: usize,
+    current_session_id: Option<String>,
+    current_session: Option<SessionTree>,
+    artifact_ids: Vec<NodeId>,
+    artifact_index: usize,
+    input_dialog: Option<InteractiveTuiInputDialog>,
+    preview: Option<InteractiveArtifactPreview>,
+    status_message: String,
+    should_quit: bool,
+}
+
+impl InteractiveTuiApp {
+    fn new(
+        provider: ProviderCli,
+        sessions_dir: PathBuf,
+        runtime: RuntimeConfig,
+        initial_session: Option<String>,
+    ) -> Result<Self, AppError> {
+        let mut app = Self {
+            provider,
+            sessions_dir,
+            runtime,
+            screen: InteractiveTuiScreen::SessionPicker,
+            session_summaries: Vec::new(),
+            picker_index: 0,
+            current_session_id: None,
+            current_session: None,
+            artifact_ids: Vec::new(),
+            artifact_index: 0,
+            input_dialog: None,
+            preview: None,
+            status_message: String::from("Ready"),
+            should_quit: false,
+        };
+
+        app.refresh_session_summaries()?;
+        if let Some(session_id) = initial_session {
+            app.switch_to_session(session_id)?;
         }
 
-        let action = prompt_input("interactive> ")?.to_lowercase();
-        match action.as_str() {
-            "p" | "prompt" => {
-                let prompt = compose_prompt()?;
-                if !prompt.trim().is_empty() {
-                    run_session_continue(
-                        SessionContinueArgs {
-                            session: session_id.clone(),
-                            prompt,
-                            provider: args.provider,
-                            sessions_dir: Some(sessions_dir.clone()),
-                        },
-                        runtime,
-                    )?;
+        Ok(app)
+    }
+
+    fn run(&mut self) -> Result<(), AppError> {
+        enable_raw_mode().map_err(|err| AppError::from_io("enable raw mode", err))?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)
+            .map_err(|err| AppError::from_io("enter alternate screen", err))?;
+
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal =
+            Terminal::new(backend).map_err(|err| AppError::from_io("create terminal", err))?;
+        let loop_result = self.event_loop(&mut terminal);
+
+        disable_raw_mode().map_err(|err| AppError::from_io("disable raw mode", err))?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)
+            .map_err(|err| AppError::from_io("leave alternate screen", err))?;
+        terminal
+            .show_cursor()
+            .map_err(|err| AppError::from_io("show cursor", err))?;
+
+        loop_result
+    }
+
+    fn event_loop(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<(), AppError> {
+        while !self.should_quit {
+            terminal
+                .draw(|frame| self.draw(frame))
+                .map_err(|err| AppError::from_io("draw interactive tui", err))?;
+
+            if event::poll(Duration::from_millis(100))
+                .map_err(|err| AppError::from_io("poll interactive event", err))?
+            {
+                let event_value = event::read()
+                    .map_err(|err| AppError::from_io("read interactive event", err))?;
+                if let Event::Key(key_event) = event_value {
+                    self.handle_key_event(key_event)?;
                 }
             }
-            "n" | "new" | "new-intent" => {
-                session_id =
-                    create_interactive_intent_session(args.provider, &sessions_dir, runtime)?;
-                runtime.text_line(format!("Switched to session '{session_id}'"));
-            }
-            "b" | "browse" => {
-                render_artifact_panel(&session, runtime);
-            }
-            "s" | "show" => {
-                let artifact = prompt_input("artifact id> ")?;
-                run_artifact_show(
-                    ArtifactShowArgs {
-                        artifact,
-                        session: Some(session_id.clone()),
-                        sessions_dir: Some(sessions_dir.clone()),
-                    },
-                    runtime,
-                )?;
-            }
-            "a" | "accept" => {
-                let artifact = prompt_input("artifact id> ")?;
-                run_artifact_mutation(
-                    ArtifactMutateArgs {
-                        artifact,
-                        session: Some(session_id.clone()),
-                        sessions_dir: Some(sessions_dir.clone()),
-                    },
-                    NodeStatus::Accepted,
-                    runtime,
-                )?;
-            }
-            "r" | "reject" => {
-                let artifact = prompt_input("artifact id> ")?;
-                run_artifact_mutation(
-                    ArtifactMutateArgs {
-                        artifact,
-                        session: Some(session_id.clone()),
-                        sessions_dir: Some(sessions_dir.clone()),
-                    },
-                    NodeStatus::Rejected,
-                    runtime,
-                )?;
-            }
-            "c" | "complete" => {
-                run_session_complete(
-                    SessionCompleteArgs {
-                        session: session_id.clone(),
-                        sessions_dir: Some(sessions_dir.clone()),
-                    },
-                    runtime,
-                )?;
-                break;
-            }
-            "q" | "quit" => break,
-            _ => runtime.text_line("Unknown action"),
+        }
+
+        Ok(())
+    }
+
+    fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
+        match self.screen {
+            InteractiveTuiScreen::SessionPicker => self.draw_session_picker(frame),
+            InteractiveTuiScreen::SessionView => self.draw_session_view(frame),
+        }
+
+        if let Some(dialog) = &self.input_dialog {
+            self.draw_input_dialog(frame, dialog);
+        }
+
+        if let Some(preview) = &self.preview {
+            self.draw_preview(frame, preview);
         }
     }
 
-    Ok(())
+    fn draw_session_picker(&self, frame: &mut ratatui::Frame<'_>) {
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(frame.area());
+
+        let mut items = self
+            .session_summaries
+            .iter()
+            .map(|summary| {
+                format!(
+                    "{} [{}] {}",
+                    summary.session_id, summary.thread_id, summary.intent_label
+                )
+            })
+            .collect::<Vec<_>>();
+        items.push(String::from("Create new intent session"));
+
+        let list_items = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let line = if index == self.picker_index {
+                    Line::styled(
+                        format!("> {item}"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Line::raw(format!("  {item}"))
+                };
+                ListItem::new(line)
+            })
+            .collect::<Vec<_>>();
+
+        frame.render_widget(
+            List::new(list_items).block(Block::default().title("Sessions").borders(Borders::ALL)),
+            layout[0],
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Enter: select/create | ↑/↓: move | q: quit  [{}]",
+                self.status_message
+            ))
+            .block(Block::default().borders(Borders::ALL).title("Help")),
+            layout[1],
+        );
+    }
+
+    fn draw_session_view(&self, frame: &mut ratatui::Frame<'_>) {
+        let Some(session) = &self.current_session else {
+            frame.render_widget(
+                Paragraph::new("No session selected")
+                    .block(Block::default().title("Session").borders(Borders::ALL)),
+                frame.area(),
+            );
+            return;
+        };
+
+        let root_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(3),
+            ])
+            .split(frame.area());
+        let body_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(root_layout[1]);
+
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Session {} [{:?}] thread={} current={}",
+                session.session_id, session.state, session.thread_id, session.current_node_id
+            ))
+            .block(Block::default().title("Session").borders(Borders::ALL)),
+            root_layout[0],
+        );
+
+        let tree_items = render_tree_lines(session)
+            .into_iter()
+            .map(ListItem::new)
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(tree_items).block(Block::default().title("Tree").borders(Borders::ALL)),
+            body_layout[0],
+        );
+
+        let artifact_items = self
+            .artifact_ids
+            .iter()
+            .enumerate()
+            .map(|(index, artifact_id)| {
+                let node = find_node(session, artifact_id);
+                let text = if let Some(node) = node {
+                    format!("{} [{:?}] {}", node.id, node.status, node.label)
+                } else {
+                    artifact_id.to_string()
+                };
+                let line = if index == self.artifact_index {
+                    Line::styled(
+                        format!("> {text}"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Line::raw(format!("  {text}"))
+                };
+                ListItem::new(line)
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(artifact_items)
+                .block(Block::default().title("Artifacts").borders(Borders::ALL)),
+            body_layout[1],
+        );
+
+        frame.render_widget(
+            Paragraph::new(format!(
+                "p: prompt | n: new intent | s: show artifact | a/r: accept/reject | c: complete | o: sessions | q: quit  [{}]",
+                self.status_message
+            ))
+            .wrap(Wrap { trim: true })
+            .block(Block::default().title("Help").borders(Borders::ALL)),
+            root_layout[2],
+        );
+    }
+
+    fn draw_input_dialog(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        dialog: &InteractiveTuiInputDialog,
+    ) {
+        let area = centered_rect(80, 50, frame.area());
+        frame.render_widget(Clear, area);
+        let title = match dialog.kind {
+            InteractiveTuiInputKind::Prompt => "Compose Prompt",
+            InteractiveTuiInputKind::NewIntent => "Create New Intent",
+        };
+        let text = format!(
+            "{}\n\nCtrl+S to submit\nEsc to cancel\n\n{}",
+            title, dialog.text
+        );
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().title(title).borders(Borders::ALL)),
+            area,
+        );
+    }
+
+    fn draw_preview(&self, frame: &mut ratatui::Frame<'_>, preview: &InteractiveArtifactPreview) {
+        let area = centered_rect(85, 70, frame.area());
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(preview.body.clone())
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title(format!("{} (Esc to close)", preview.title))
+                        .borders(Borders::ALL),
+                ),
+            area,
+        );
+    }
+
+    fn handle_key_event(&mut self, key_event: KeyEvent) -> Result<(), AppError> {
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && key_event.code == KeyCode::Char('c')
+        {
+            self.should_quit = true;
+            return Ok(());
+        }
+
+        if self.preview.is_some() {
+            if matches!(key_event.code, KeyCode::Esc | KeyCode::Enter) {
+                self.preview = None;
+            }
+            return Ok(());
+        }
+
+        if self.input_dialog.is_some() {
+            return self.handle_input_dialog_key(key_event);
+        }
+
+        match self.screen {
+            InteractiveTuiScreen::SessionPicker => self.handle_picker_key(key_event),
+            InteractiveTuiScreen::SessionView => self.handle_session_key(key_event),
+        }
+    }
+
+    fn handle_picker_key(&mut self, key_event: KeyEvent) -> Result<(), AppError> {
+        let option_count = self.session_summaries.len() + 1;
+        match key_event.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Up => {
+                if self.picker_index == 0 {
+                    self.picker_index = option_count.saturating_sub(1);
+                } else {
+                    self.picker_index -= 1;
+                }
+            }
+            KeyCode::Down => {
+                self.picker_index = (self.picker_index + 1) % option_count.max(1);
+            }
+            KeyCode::Enter => {
+                if self.picker_index == self.session_summaries.len() {
+                    self.open_input_dialog(InteractiveTuiInputKind::NewIntent);
+                } else if let Some(summary) = self.session_summaries.get(self.picker_index) {
+                    self.switch_to_session(summary.session_id.clone())?;
+                }
+            }
+            KeyCode::Char('r') => self.refresh_session_summaries()?,
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn handle_session_key(&mut self, key_event: KeyEvent) -> Result<(), AppError> {
+        match key_event.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('o') => {
+                self.refresh_session_summaries()?;
+                self.screen = InteractiveTuiScreen::SessionPicker;
+            }
+            KeyCode::Up => {
+                if self.artifact_ids.is_empty() {
+                    return Ok(());
+                }
+                if self.artifact_index == 0 {
+                    self.artifact_index = self.artifact_ids.len() - 1;
+                } else {
+                    self.artifact_index -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.artifact_ids.is_empty() {
+                    return Ok(());
+                }
+                self.artifact_index = (self.artifact_index + 1) % self.artifact_ids.len();
+            }
+            KeyCode::Char('p') => self.open_input_dialog(InteractiveTuiInputKind::Prompt),
+            KeyCode::Char('n') => self.open_input_dialog(InteractiveTuiInputKind::NewIntent),
+            KeyCode::Char('b') => {
+                self.status_message = String::from("Artifacts are visible in the right panel");
+            }
+            KeyCode::Char('s') => self.open_artifact_preview()?,
+            KeyCode::Char('a') => self.mutate_selected_artifact(NodeStatus::Accepted)?,
+            KeyCode::Char('r') => self.mutate_selected_artifact(NodeStatus::Rejected)?,
+            KeyCode::Char('c') => self.complete_current_session()?,
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn handle_input_dialog_key(&mut self, key_event: KeyEvent) -> Result<(), AppError> {
+        if key_event.code == KeyCode::Esc {
+            self.input_dialog = None;
+            return Ok(());
+        }
+
+        if key_event.modifiers.contains(KeyModifiers::CONTROL)
+            && key_event.code == KeyCode::Char('s')
+        {
+            let dialog = self.input_dialog.take().ok_or_else(|| {
+                AppError::Internal(String::from("interactive input dialog missing"))
+            })?;
+            return self.submit_input_dialog(dialog);
+        }
+
+        if let Some(dialog) = self.input_dialog.as_mut() {
+            match key_event.code {
+                KeyCode::Backspace => {
+                    dialog.text.pop();
+                }
+                KeyCode::Enter => dialog.text.push('\n'),
+                KeyCode::Char(ch) => {
+                    if !key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                        dialog.text.push(ch);
+                    }
+                }
+                KeyCode::Tab => dialog.text.push('\t'),
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn submit_input_dialog(&mut self, dialog: InteractiveTuiInputDialog) -> Result<(), AppError> {
+        let text = dialog.text.trim().to_string();
+        if text.is_empty() {
+            self.status_message = String::from("Input cannot be empty");
+            return Ok(());
+        }
+
+        match dialog.kind {
+            InteractiveTuiInputKind::Prompt => self.submit_prompt(text),
+            InteractiveTuiInputKind::NewIntent => self.create_new_intent(text),
+        }
+    }
+
+    fn submit_prompt(&mut self, prompt: String) -> Result<(), AppError> {
+        let Some(session_id) = &self.current_session_id else {
+            return Err(AppError::InvalidState(String::from(
+                "no active session selected for prompt submission",
+            )));
+        };
+
+        run_session_continue(
+            SessionContinueArgs {
+                session: session_id.clone(),
+                prompt,
+                provider: self.provider,
+                sessions_dir: Some(self.sessions_dir.clone()),
+            },
+            &self.quiet_runtime(),
+        )?;
+        self.refresh_current_session()?;
+        self.status_message = String::from("Prompt executed");
+        Ok(())
+    }
+
+    fn create_new_intent(&mut self, intent: String) -> Result<(), AppError> {
+        run_session_create(
+            SessionCreateArgs {
+                intent,
+                provider: self.provider,
+                sessions_dir: Some(self.sessions_dir.clone()),
+            },
+            &self.quiet_runtime(),
+        )?;
+
+        let new_session_id = most_recent_session_id(&self.sessions_dir)?;
+        self.refresh_session_summaries()?;
+        self.switch_to_session(new_session_id)?;
+        self.status_message = String::from("Created and switched to new session");
+        Ok(())
+    }
+
+    fn open_artifact_preview(&mut self) -> Result<(), AppError> {
+        let Some(session) = &self.current_session else {
+            return Ok(());
+        };
+        let Some(artifact_id) = self.selected_artifact_id().cloned() else {
+            self.status_message = String::from("No artifact selected");
+            return Ok(());
+        };
+
+        let Some(node) = find_node(session, &artifact_id) else {
+            self.status_message = String::from("Selected artifact node not found");
+            return Ok(());
+        };
+
+        let body = match &node.payload_ref {
+            Some(relative_path) => {
+                let session_id = self.current_session_id.as_ref().ok_or_else(|| {
+                    AppError::InvalidState(String::from("missing current session id"))
+                })?;
+                let payload_path = self.sessions_dir.join(session_id).join(relative_path);
+                fs::read_to_string(&payload_path)
+                    .map_err(|err| AppError::from_io("read artifact payload for preview", err))?
+            }
+            None => String::from("<artifact has no payload reference>"),
+        };
+
+        self.preview = Some(InteractiveArtifactPreview {
+            title: node.id.to_string(),
+            body,
+        });
+        Ok(())
+    }
+
+    fn mutate_selected_artifact(&mut self, target_status: NodeStatus) -> Result<(), AppError> {
+        let Some(artifact_id) = self.selected_artifact_id().cloned() else {
+            self.status_message = String::from("No artifact selected");
+            return Ok(());
+        };
+
+        let Some(session_id) = &self.current_session_id else {
+            return Err(AppError::InvalidState(String::from(
+                "no active session selected for artifact mutation",
+            )));
+        };
+
+        run_artifact_mutation(
+            ArtifactMutateArgs {
+                artifact: artifact_id.to_string(),
+                session: Some(session_id.clone()),
+                sessions_dir: Some(self.sessions_dir.clone()),
+            },
+            target_status,
+            &self.quiet_runtime(),
+        )?;
+
+        self.refresh_current_session()?;
+        self.status_message = format!("Updated artifact '{}' to {:?}", artifact_id, target_status);
+        Ok(())
+    }
+
+    fn complete_current_session(&mut self) -> Result<(), AppError> {
+        let Some(session_id) = &self.current_session_id else {
+            return Err(AppError::InvalidState(String::from(
+                "no active session selected for completion",
+            )));
+        };
+
+        run_session_complete(
+            SessionCompleteArgs {
+                session: session_id.clone(),
+                sessions_dir: Some(self.sessions_dir.clone()),
+            },
+            &self.quiet_runtime(),
+        )?;
+        self.refresh_current_session()?;
+        self.status_message = String::from("Session marked as completed");
+        Ok(())
+    }
+
+    fn open_input_dialog(&mut self, kind: InteractiveTuiInputKind) {
+        self.input_dialog = Some(InteractiveTuiInputDialog {
+            kind,
+            text: String::new(),
+        });
+    }
+
+    fn quiet_runtime(&self) -> RuntimeConfig {
+        RuntimeConfig {
+            output_mode: OutputMode::Text,
+            quiet: true,
+            no_color: self.runtime.no_color,
+        }
+    }
+
+    fn refresh_session_summaries(&mut self) -> Result<(), AppError> {
+        self.session_summaries = load_session_summaries(&self.sessions_dir)?;
+        if self.picker_index > self.session_summaries.len() {
+            self.picker_index = self.session_summaries.len();
+        }
+        Ok(())
+    }
+
+    fn refresh_current_session(&mut self) -> Result<(), AppError> {
+        let Some(session_id) = &self.current_session_id else {
+            self.current_session = None;
+            self.artifact_ids.clear();
+            return Ok(());
+        };
+
+        let session_dir = self.sessions_dir.join(session_id);
+        let session = read_session_json(&session_dir)
+            .map_err(|err| AppError::from_io("reload session", err))?;
+        self.artifact_ids = session
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Artifact)
+            .map(|node| node.id.clone())
+            .collect();
+        if self.artifact_index >= self.artifact_ids.len() {
+            self.artifact_index = self.artifact_ids.len().saturating_sub(1);
+        }
+        self.current_session = Some(session);
+
+        Ok(())
+    }
+
+    fn switch_to_session(&mut self, session_id: String) -> Result<(), AppError> {
+        self.current_session_id = Some(session_id.clone());
+        self.screen = InteractiveTuiScreen::SessionView;
+        self.preview = None;
+        self.input_dialog = None;
+        self.refresh_current_session()?;
+        self.status_message = format!("Loaded session '{session_id}'");
+        Ok(())
+    }
+
+    fn selected_artifact_id(&self) -> Option<&NodeId> {
+        self.artifact_ids.get(self.artifact_index)
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+
+    horizontal[1]
 }
 
 fn run_session_auto(args: SessionAutoArgs, runtime: &RuntimeConfig) -> Result<(), AppError> {
@@ -1769,64 +2326,6 @@ fn default_sessions_dir() -> PathBuf {
     PathBuf::from(".delve/sessions")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum InteractiveSessionSelection {
-    Existing(String),
-    CreateNew,
-}
-
-fn choose_interactive_session(
-    sessions_dir: &Path,
-) -> Result<InteractiveSessionSelection, AppError> {
-    let summaries = load_session_summaries(sessions_dir)?;
-
-    if summaries.is_empty() {
-        println!("No sessions found in '{}'.", sessions_dir.display());
-    } else {
-        println!("Recent sessions:");
-        for (idx, summary) in summaries.iter().take(10).enumerate() {
-            println!(
-                "  {}: {} [{}] {}",
-                idx + 1,
-                summary.session_id,
-                summary.thread_id,
-                summary.intent_label
-            );
-        }
-    }
-    println!("  n: create new intent session");
-
-    let choice = prompt_input("Select session number or 'n'> ")?;
-    resolve_interactive_session_choice(&choice, &summaries)
-}
-
-fn resolve_interactive_session_choice(
-    choice: &str,
-    summaries: &[SessionSummary],
-) -> Result<InteractiveSessionSelection, AppError> {
-    let normalized = choice.trim().to_ascii_lowercase();
-    if matches!(normalized.as_str(), "n" | "new" | "create") {
-        return Ok(InteractiveSessionSelection::CreateNew);
-    }
-
-    if summaries.is_empty() {
-        return Err(AppError::InvalidState(String::from(
-            "no sessions available; enter 'n' to create a new intent session",
-        )));
-    }
-
-    let index = normalized
-        .parse::<usize>()
-        .map_err(|_| AppError::InvalidState(String::from("invalid session picker input")))?;
-    let selected = summaries.get(index.saturating_sub(1)).ok_or_else(|| {
-        AppError::InvalidState(String::from("selected session index is out of range"))
-    })?;
-
-    Ok(InteractiveSessionSelection::Existing(
-        selected.session_id.clone(),
-    ))
-}
-
 fn most_recent_session_id(sessions_dir: &Path) -> Result<String, AppError> {
     let summaries = load_session_summaries(sessions_dir)?;
     summaries
@@ -1835,31 +2334,6 @@ fn most_recent_session_id(sessions_dir: &Path) -> Result<String, AppError> {
         .ok_or_else(|| {
             AppError::NotFound(format!("no sessions found in '{}'", sessions_dir.display()))
         })
-}
-
-fn create_interactive_intent_session(
-    provider: ProviderCli,
-    sessions_dir: &Path,
-    runtime: &RuntimeConfig,
-) -> Result<String, AppError> {
-    loop {
-        let intent = compose_prompt()?;
-        if intent.trim().is_empty() {
-            runtime.text_line("Intent cannot be empty");
-            continue;
-        }
-
-        run_session_create(
-            SessionCreateArgs {
-                intent,
-                provider,
-                sessions_dir: Some(sessions_dir.to_path_buf()),
-            },
-            runtime,
-        )?;
-
-        return most_recent_session_id(sessions_dir);
-    }
 }
 
 fn prompt_input(prompt: &str) -> Result<String, AppError> {
@@ -1874,20 +2348,6 @@ fn prompt_input(prompt: &str) -> Result<String, AppError> {
         .read_line(&mut line)
         .map_err(|err| AppError::from_io("read stdin", err))?;
     Ok(line.trim().to_string())
-}
-
-fn compose_prompt() -> Result<String, AppError> {
-    println!("Enter prompt text. Finish with a single '.' on its own line.");
-    let mut lines = Vec::new();
-    loop {
-        let line = prompt_input("prompt> ")?;
-        if line == "." {
-            break;
-        }
-        lines.push(line);
-    }
-
-    Ok(lines.join("\n"))
 }
 
 fn render_tree_lines(session: &SessionTree) -> Vec<String> {
@@ -1910,27 +2370,6 @@ fn render_tree_lines(session: &SessionTree) -> Vec<String> {
     let mut lines = Vec::new();
     walk(session, &session.intent_node_id, 0, &mut lines);
     lines
-}
-
-fn render_artifact_panel(session: &SessionTree, runtime: &RuntimeConfig) {
-    if runtime.output_mode != OutputMode::Text || runtime.quiet {
-        return;
-    }
-
-    println!("Artifacts:");
-    for node in &session.nodes {
-        if node.kind == NodeKind::Artifact {
-            println!(
-                "  {} [{:?}] parent={} label=\"{}\"",
-                node.id,
-                node.status,
-                node.parent_id
-                    .as_ref()
-                    .map_or("<none>", |parent| parent.as_str()),
-                node.label
-            );
-        }
-    }
 }
 
 fn build_review_rubric(
@@ -2081,9 +2520,8 @@ mod tests {
 
     use super::{
         load_auto_resume_state, load_session_summaries, looks_like_amp_thread_id,
-        resolve_interactive_session_choice, session_thread_id_requires_refresh, ArtifactCommand,
-        Cli, Command, InteractiveSessionSelection, InterruptController, ProviderCli,
-        SessionCheckpoint, SessionCommand, SessionState, SessionSummary,
+        session_thread_id_requires_refresh, ArtifactCommand, Cli, Command, InterruptController,
+        ProviderCli, SessionCheckpoint, SessionCommand, SessionState,
     };
 
     #[test]
@@ -2216,44 +2654,6 @@ mod tests {
             ProviderCli::Echo,
             "thread-echo-123"
         ));
-    }
-
-    #[test]
-    fn interactive_session_selector_supports_create_new_option() {
-        let selection = resolve_interactive_session_choice("n", &[])
-            .expect("new option should be accepted when no sessions exist");
-
-        assert_eq!(selection, InteractiveSessionSelection::CreateNew);
-    }
-
-    #[test]
-    fn interactive_session_selector_resolves_existing_session_index() {
-        let summaries = vec![
-            SessionSummary {
-                session_id: String::from("session-200"),
-                thread_id: String::from("T-12345678-1234-1234-1234-1234567890ab"),
-                state: SessionState::Active,
-                current_node_id: String::from("prompt-2"),
-                intent_label: String::from("Newer intent"),
-                node_count: 4,
-            },
-            SessionSummary {
-                session_id: String::from("session-100"),
-                thread_id: String::from("thread-echo-legacy"),
-                state: SessionState::Completed,
-                current_node_id: String::from("prompt-1"),
-                intent_label: String::from("Older intent"),
-                node_count: 2,
-            },
-        ];
-
-        let selection = resolve_interactive_session_choice("2", &summaries)
-            .expect("second session should resolve");
-
-        assert_eq!(
-            selection,
-            InteractiveSessionSelection::Existing(String::from("session-100"))
-        );
     }
 
     fn unique_test_dir(label: &str) -> std::path::PathBuf {
