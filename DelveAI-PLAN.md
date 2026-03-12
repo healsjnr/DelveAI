@@ -218,7 +218,82 @@ Phase exit criteria:
 1. Interactive and auto-interactive modes work reliably.
 2. Interrupt and resume behavior is predictable and tested.
 
-## Phase 7 - Git-Backed Implementation Artifacts
+## Phase 7 - Remove Next-Prompt Suggestion
+
+Objective: Remove the next-prompt suggestion feature from orchestration, CLI, and auto-interactive loop.
+
+Tasks:
+- [ ] Delete `suggest_next_prompt_with_provider()` function from `delve-orchestrator`.
+- [ ] Remove `next_prompt` field from `PromptExecutionResult` in `delve-orchestrator`.
+- [ ] Remove `suggest_next_prompt_for_provider()` wrapper and all call sites in `delve-cli` (`run_session_create`, `run_session_continue`, interactive loop, auto-interactive loop).
+- [ ] Remove `suggested_next_prompt` field from `SessionCreateOutput` and `SessionContinueOutput`.
+- [ ] Remove `OrchestrationDecision` event appends for `stage: "suggest_next_prompt"` across all CLI flows.
+- [ ] Remove or update the `suggest_next_prompt_uses_provider_and_thread_id` unit test in `delve-orchestrator`.
+- [ ] Remove "Suggested next prompt:" text output line and update auto-loop to rely solely on user-composed or review-driven prompts.
+- [ ] Remove the next-prompt suggestion task references from Phase 4 and Phase 6 task lists.
+- [ ] Compile, run `make check`, fix any dead-code warnings.
+
+Phase exit criteria:
+1. No next-prompt suggestion logic remains in any crate.
+2. All existing tests pass with the suggestion code removed.
+3. Auto-interactive loop functions without suggestion-driven continuation.
+
+## Phase 8 - Direct Artifact Editing
+
+Objective: Allow users to edit the content of proposed artifacts before accepting or rejecting them.
+
+Tasks:
+- [ ] Add `SessionNode::is_editable()` method to `delve-domain` returning true only when status is `Proposed`.
+- [ ] Add `SessionEventKind::ArtifactEdited` variant to the event schema in `delve-storage`.
+- [ ] Add `ArtifactEdit` command variant and `ArtifactEditArgs` struct to `delve-cli` with `--session`, `--artifact`, optional `--content <path>`, and `--stdin` flags.
+- [ ] Implement `run_artifact_edit()` in `delve-cli`: load session, find artifact node, verify `is_editable()`, read new content (from file, stdin, or `$EDITOR`), overwrite `payload_ref` file, log `ArtifactEdited` event.
+- [ ] Implement `$EDITOR` flow: resolve editor from `$EDITOR` env var (fallback to `vi`), spawn editor on `payload_ref` path, wait for exit, re-read file.
+- [ ] Add "Edit" option to the interactive mode action menu, gated on `Proposed` status.
+- [ ] Add integration tests: edit proposed artifact succeeds; edit accepted artifact fails with correct error.
+- [ ] Add unit tests for `is_editable()` across all `NodeStatus` variants.
+
+Phase exit criteria:
+1. Proposed artifacts can be edited via CLI (non-interactive and interactive).
+2. Editing is blocked for non-Proposed artifacts with a clear error message.
+3. All edits are logged as `ArtifactEdited` events.
+
+## Phase 9 - Artifact Regeneration
+
+Objective: Allow users to re-execute the prompt that created an artifact, producing a new sibling artifact.
+
+Tasks:
+- [ ] Add `SessionTree::find_parent_prompt(artifact_node_id) -> Option<&SessionNode>` helper to `delve-domain`.
+- [ ] Add `read_prompt_text(session_dir, prompt_node) -> Result<String>` helper to `delve-storage` that reads the prompt's `payload_ref` markdown file.
+- [ ] Add `ArtifactRegenerate` command variant and `ArtifactRegenerateArgs` struct to `delve-cli` with `--session` and `--artifact` flags.
+- [ ] Implement `run_artifact_regenerate()` in `delve-cli`: load session, find parent prompt, read prompt text, call `execute_provider_prompt_streaming()`, append new artifact node as sibling under the same prompt, save session, log events.
+- [ ] Add "Regenerate" option to the interactive mode action menu alongside Accept/Reject.
+- [ ] Add integration test: create session, get artifact, regenerate, verify two sibling artifacts exist under the same prompt.
+- [ ] Add unit test for `find_parent_prompt` helper.
+
+Phase exit criteria:
+1. Users can regenerate any artifact, producing a new sibling under the same prompt.
+2. Original artifact is preserved and can be independently accepted or rejected.
+3. Regeneration uses the same provider and thread context as the original execution.
+
+## Phase 10 - LLM-Powered Label Naming
+
+Objective: Replace truncated-text label slugs with short LLM-generated summaries for readable naming.
+
+Tasks:
+- [ ] Add `generate_short_name(text: &str) -> Result<String, ProviderError>` utility to `delve-providers` with a system prompt instructing: "Return a 3-5 word summary suitable as a filesystem-safe label. No punctuation, no explanation."
+- [ ] Change `generate_intent_label`, `generate_prompt_label`, `generate_artifact_label` signatures in `delve-storage` to accept an optional `short_name: Option<&str>` parameter.
+- [ ] Add `generate_label_with_summary(kind, source, short_name)` to `delve-storage` that uses the short name for the slug but preserves the original source for hash stability.
+- [ ] Update all label generation call sites in `delve-cli` (`session create`, `session continue`, `append_generated_prompt_and_artifact`) to call `generate_short_name()` before generating the label.
+- [ ] Wrap naming LLM calls with fallback: if the call fails, log a warning and fall back to existing truncation behavior.
+- [ ] Update unit tests for label generation to cover the short-name path.
+- [ ] Add integration test verifying labels use LLM-generated names with mock provider.
+
+Phase exit criteria:
+1. Labels use LLM-generated short names when a provider is available.
+2. Label generation gracefully falls back to truncation when the naming call fails.
+3. LLM naming calls are not recorded as prompt/artifact nodes in the session tree.
+
+## Phase 11 - Git-Backed Implementation Artifacts
 
 Objective: Support code-change artifacts with safe branch/ref lifecycle.
 
@@ -243,7 +318,7 @@ Phase exit criteria:
 1. Implementation artifacts can reliably reference git branches/commits.
 2. Unsafe repo states fail fast with actionable guidance.
 
-## Phase 8 - Local API Server For Frontend
+## Phase 12 - Local API Server For Frontend
 
 Objective: Expose stable local APIs so web frontend reuses CLI/domain logic.
 
@@ -256,6 +331,7 @@ Tasks:
 - [ ] Define continue session endpoint with prompt payload.
 - [ ] Define artifact accept/reject endpoints.
 - [ ] Define artifact content endpoint.
+- [ ] Define artifact edit and regenerate endpoints.
 - [ ] Define live activity endpoint (polling or SSE).
 - [ ] Implement DTO mappings from domain types.
 - [ ] Implement standardized API error schema.
@@ -268,7 +344,7 @@ Phase exit criteria:
 1. Frontend can consume all required workflow APIs.
 2. API contracts are stable and documented.
 
-## Phase 9 - Local Web Frontend V1
+## Phase 13 - Local Web Frontend V1
 
 Objective: Provide intuitive artifact-centric UX on top of local API.
 
@@ -280,6 +356,8 @@ Tasks:
 - [ ] Build node detail panel with metadata.
 - [ ] Build artifact markdown viewer.
 - [ ] Build accept/reject action controls.
+- [ ] Build artifact edit controls with inline editor.
+- [ ] Build artifact regenerate action and loading state.
 - [ ] Build prompt composer and submit workflow.
 - [ ] Build run status/activity timeline panel.
 - [ ] Build auto-interactive run controls.
@@ -293,7 +371,29 @@ Phase exit criteria:
 1. Users can complete core session workflows without CLI.
 2. Frontend behavior matches CLI/domain rules.
 
-## Phase 10 - Quality, Hardening, And Release
+## Phase 14 - Sub-Agent Artifact Capture
+
+Objective: Capture sub-agent results from provider responses as sibling artifacts alongside the main prompt result.
+
+Tasks:
+- [ ] Extend `ProviderResponse` in `delve-providers` to expose structured message entries including `type`, `content` array, and `parent_tool_use_id` fields.
+- [ ] Add sub-agent detection logic in `delve-orchestrator`: identify response entries where `type` is `assistant`, content `type` is `text`, and `parent_tool_use_id` is not null.
+- [ ] Extend `ArtifactProposal` to carry an optional `source_tool_use_id` field for traceability.
+- [ ] Update `generate_artifact_streaming_with_thread` (or equivalent) to split a single provider response into multiple `ArtifactProposal` entries: one for the main result, one per sub-agent result.
+- [ ] Persist each sub-agent artifact as a sibling node under the same prompt node in the session tree.
+- [ ] Include `parent_tool_use_id` in artifact event metadata for auditability.
+- [ ] Update `session show` tree visualization to distinguish sub-agent artifacts (e.g., with a label suffix or icon).
+- [ ] Update interactive mode artifact browsing to display sub-agent artifacts grouped under their parent prompt.
+- [ ] Add unit tests for sub-agent detection logic with mock provider responses containing zero, one, and multiple sub-agent entries.
+- [ ] Add integration test: execute a prompt that returns sub-agent results, verify all are persisted as sibling artifacts.
+- [ ] Add test for edge case: provider response with no sub-agent results produces a single artifact as before.
+
+Phase exit criteria:
+1. Sub-agent results are automatically captured as individual sibling artifacts.
+2. Existing single-result behavior is unchanged when no sub-agent entries are present.
+3. Sub-agent artifacts are visible and manageable (accept/reject/edit/regenerate) like any other artifact.
+
+## Phase 15 - Quality, Hardening, And Release
 
 Objective: Validate reliability, polish docs, and ship V1 release candidate.
 
@@ -324,7 +424,10 @@ Phase exit criteria:
 2. In Phase 2 and 3, Domain and Storage agents can work in parallel with shared schema checkpoints.
 3. In Phase 4, provider adapters and review pipeline can split across two sub-agents.
 4. In Phase 5 and 6, interactive and non-interactive CLI work can be split once shared command core exists.
-5. In Phase 8 and 9, API and frontend can run in parallel after endpoint contracts are frozen.
+5. Phase 7 is independent and can start immediately after Phase 6.
+6. Phases 8, 9, and 10 can run in parallel after Phase 7 completes (no cross-dependencies).
+7. Phase 14 can run in parallel with Phases 11, 12, and 13 (independent provider/orchestration work).
+8. In Phase 12 and 13, API and frontend can run in parallel after endpoint contracts are frozen.
 
 ## Dependencies Summary
 
@@ -332,13 +435,19 @@ Phase exit criteria:
 2. Phase 1 must complete before all code phases.
 3. Phase 2 and 3 must complete before robust orchestration.
 4. Phase 4 should complete before auto-interactive UX stabilizes.
-5. Phase 8 should complete before frontend feature completion.
-6. Phase 10 begins once all functional phases reach baseline completeness.
+5. Phase 7 depends on Phase 4, 5, and 6 (removes code introduced in those phases).
+6. Phase 8 and 9 depend on Phase 7 (suggestion removal simplifies the flows they modify).
+7. Phase 10 depends on Phase 4 (extends provider trait) and Phase 3 (modifies label generation).
+8. Phase 14 depends on Phase 4 (extends provider response schema) and Phase 9 (sibling artifact pattern).
+9. Phase 12 should complete before frontend feature completion.
+10. Phase 15 begins once all functional phases reach baseline completeness.
 
 ## Milestone Definitions
 
 1. Milestone A: CLI can create and continue sessions with persisted trees.
 2. Milestone B: Auto-interactive loop runs with review gating and resume support.
-3. Milestone C: Git-backed implementation artifacts are stable.
-4. Milestone D: Web frontend supports end-to-end local workflows.
-5. Milestone E: V1 release candidate validated and shipped.
+3. Milestone B2: Next-prompt suggestion removed, artifact editing and regeneration available, labels use LLM-generated names.
+4. Milestone C: Git-backed implementation artifacts are stable.
+5. Milestone C2: Sub-agent results captured as individual artifacts.
+6. Milestone D: Web frontend supports end-to-end local workflows.
+7. Milestone E: V1 release candidate validated and shipped.

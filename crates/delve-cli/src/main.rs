@@ -40,7 +40,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::Terminal;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use serde::Serialize;
 use serde_json::json;
 
@@ -1063,6 +1063,39 @@ enum InteractiveTuiInputKind {
     NewIntent,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InteractivePaneFocus {
+    Tree,
+    Viewer,
+    Output,
+}
+
+impl InteractivePaneFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::Tree => Self::Viewer,
+            Self::Viewer => Self::Output,
+            Self::Output => Self::Tree,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Tree => Self::Output,
+            Self::Viewer => Self::Tree,
+            Self::Output => Self::Viewer,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tree => "Tree",
+            Self::Viewer => "Viewer",
+            Self::Output => "Current Session Output",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct InteractiveTuiInputDialog {
     kind: InteractiveTuiInputKind,
@@ -1100,8 +1133,11 @@ struct InteractiveTuiApp {
     picker_index: usize,
     current_session_id: Option<String>,
     current_session: Option<SessionTree>,
-    artifact_ids: Vec<NodeId>,
-    artifact_index: usize,
+    tree_node_ids: Vec<NodeId>,
+    tree_selection_index: usize,
+    viewer_pane_text: String,
+    viewer_scroll_offset: usize,
+    focused_pane: InteractivePaneFocus,
     input_dialog: Option<InteractiveTuiInputDialog>,
     preview: Option<InteractiveArtifactPreview>,
     stream_output_by_session: HashMap<String, String>,
@@ -1130,8 +1166,11 @@ impl InteractiveTuiApp {
             picker_index: 0,
             current_session_id: None,
             current_session: None,
-            artifact_ids: Vec::new(),
-            artifact_index: 0,
+            tree_node_ids: Vec::new(),
+            tree_selection_index: 0,
+            viewer_pane_text: String::from("Select a session to view nodes"),
+            viewer_scroll_offset: 0,
+            focused_pane: InteractivePaneFocus::Tree,
             input_dialog: None,
             preview: None,
             stream_output_by_session: HashMap::new(),
@@ -1307,14 +1346,14 @@ impl InteractiveTuiApp {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
-                Constraint::Min(8),
-                Constraint::Length(8),
+                Constraint::Min(6),
+                Constraint::Length(12),
                 Constraint::Length(3),
             ])
             .split(frame.area());
         let body_layout = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
             .split(root_layout[1]);
 
         let header_text = if let Some(session) = &self.current_session {
@@ -1334,47 +1373,72 @@ impl InteractiveTuiApp {
             root_layout[0],
         );
 
+        let selected_pane_border_style = Style::default().add_modifier(Modifier::BOLD);
+
         let tree_items = if let Some(session) = &self.current_session {
-            render_tree_lines(session)
-                .into_iter()
-                .map(ListItem::new)
+            let entries = render_tree_entries(session);
+            let visible_rows = usize::from(body_layout[0].height.saturating_sub(2)).max(1);
+            let tree_start =
+                resolve_tree_window_start(self.tree_selection_index, entries.len(), visible_rows);
+            let tree_end = (tree_start + visible_rows).min(entries.len());
+
+            entries[tree_start..tree_end]
+                .iter()
+                .enumerate()
+                .map(|(offset, (_, entry_text))| {
+                    let absolute_index = tree_start + offset;
+                    if absolute_index == self.tree_selection_index {
+                        ListItem::new(Line::styled(
+                            format!("> {entry_text}"),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ))
+                    } else {
+                        ListItem::new(Line::raw(format!("  {entry_text}")))
+                    }
+                })
                 .collect::<Vec<_>>()
         } else {
             vec![ListItem::new("Session data is loading...")]
         };
-        frame.render_widget(
-            List::new(tree_items).block(Block::default().title("Tree").borders(Borders::ALL)),
-            body_layout[0],
-        );
+        let tree_title = if self.focused_pane == InteractivePaneFocus::Tree {
+            String::from("Tree [selected]")
+        } else {
+            String::from("Tree")
+        };
+        let tree_block = if self.focused_pane == InteractivePaneFocus::Tree {
+            Block::default()
+                .title(tree_title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .border_style(selected_pane_border_style)
+        } else {
+            Block::default().title(tree_title).borders(Borders::ALL)
+        };
+        frame.render_widget(List::new(tree_items).block(tree_block), body_layout[0]);
 
-        let artifact_items = self
-            .artifact_ids
-            .iter()
-            .enumerate()
-            .map(|(index, artifact_id)| {
-                let node = self
-                    .current_session
-                    .as_ref()
-                    .and_then(|session| find_node(session, artifact_id));
-                let text = if let Some(node) = node {
-                    format!("{} [{:?}] {}", node.id, node.status, node.label)
-                } else {
-                    artifact_id.to_string()
-                };
-                let line = if index == self.artifact_index {
-                    Line::styled(
-                        format!("> {text}"),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    Line::raw(format!("  {text}"))
-                };
-                ListItem::new(line)
-            })
-            .collect::<Vec<_>>();
+        let viewer_title = self.selected_tree_node().map_or_else(
+            || String::from("Viewer"),
+            |node| format!("Viewer: {} [{:?}]", node.id, node.kind),
+        );
+        let viewer_scroll = resolve_content_scroll_offset(
+            &self.viewer_pane_text,
+            body_layout[1].height,
+            self.viewer_scroll_offset,
+        );
+        let viewer_block = if self.focused_pane == InteractivePaneFocus::Viewer {
+            Block::default()
+                .title(format!("{viewer_title} [selected]"))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .border_style(selected_pane_border_style)
+        } else {
+            Block::default().title(viewer_title).borders(Borders::ALL)
+        };
         frame.render_widget(
-            List::new(artifact_items)
-                .block(Block::default().title("Artifacts").borders(Borders::ALL)),
+            Paragraph::new(self.viewer_pane_text.clone())
+                .wrap(Wrap { trim: false })
+                .block(viewer_block)
+                .scroll((viewer_scroll, 0)),
             body_layout[1],
         );
 
@@ -1389,10 +1453,19 @@ impl InteractiveTuiApp {
         } else {
             String::from("Current Session Output")
         };
+        let output_block = if self.focused_pane == InteractivePaneFocus::Output {
+            Block::default()
+                .title(format!("{output_title} [selected]"))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .border_style(selected_pane_border_style)
+        } else {
+            Block::default().title(output_title).borders(Borders::ALL)
+        };
         frame.render_widget(
             Paragraph::new(session_stream_output)
                 .wrap(Wrap { trim: false })
-                .block(Block::default().title(output_title).borders(Borders::ALL))
+                .block(output_block)
                 .scroll((output_scroll, 0)),
             root_layout[2],
         );
@@ -1405,7 +1478,8 @@ impl InteractiveTuiApp {
 
         frame.render_widget(
             Paragraph::new(format!(
-                "p: prompt | n: new intent | s: show artifact | a/r: accept/reject | c: complete | [/]: output scroll | End: live tail | o: sessions | q: quit | running={}  [{}]",
+                "Tab/Shift+Tab: focus panes (current={}) | ↑/↓/PgUp/PgDn: scroll focused pane | p: prompt | n: new intent | s: open fullscreen viewer | a/r: accept/reject artifact | c: complete | End: live tail (output) | o: sessions | q: quit | running={}  [{}]",
+                self.focused_pane.label(),
                 running_indicator,
                 self.status_message
             ))
@@ -1513,31 +1587,22 @@ impl InteractiveTuiApp {
                 self.refresh_session_summaries()?;
                 self.screen = InteractiveTuiScreen::SessionPicker;
             }
-            KeyCode::Up => {
-                if self.artifact_ids.is_empty() {
-                    return Ok(());
-                }
-                if self.artifact_index == 0 {
-                    self.artifact_index = self.artifact_ids.len() - 1;
-                } else {
-                    self.artifact_index -= 1;
-                }
-            }
-            KeyCode::Down => {
-                if self.artifact_ids.is_empty() {
-                    return Ok(());
-                }
-                self.artifact_index = (self.artifact_index + 1) % self.artifact_ids.len();
-            }
+            KeyCode::Tab => self.focused_pane = self.focused_pane.next(),
+            KeyCode::BackTab => self.focused_pane = self.focused_pane.previous(),
+            KeyCode::Up => self.scroll_focused_pane_up(1),
+            KeyCode::Down => self.scroll_focused_pane_down(1),
+            KeyCode::PageUp => self.scroll_focused_pane_up(8),
+            KeyCode::PageDown => self.scroll_focused_pane_down(8),
             KeyCode::Char('p') => self.open_input_dialog(InteractiveTuiInputKind::Prompt),
             KeyCode::Char('n') => self.open_input_dialog(InteractiveTuiInputKind::NewIntent),
-            KeyCode::Char('[') | KeyCode::PageUp => self.scroll_output_up(3),
-            KeyCode::Char(']') | KeyCode::PageDown => self.scroll_output_down(3),
-            KeyCode::End => self.follow_live_output(),
-            KeyCode::Char('b') => {
-                self.status_message = String::from("Artifacts are visible in the right panel");
+            KeyCode::Char('[') => self.scroll_focused_pane_up(3),
+            KeyCode::Char(']') => self.scroll_focused_pane_down(3),
+            KeyCode::End => {
+                if self.focused_pane == InteractivePaneFocus::Output {
+                    self.follow_live_output();
+                }
             }
-            KeyCode::Char('s') => self.open_artifact_preview()?,
+            KeyCode::Char('s') => self.open_selected_node_preview(),
             KeyCode::Char('a') => self.mutate_selected_artifact(NodeStatus::Accepted)?,
             KeyCode::Char('r') => self.mutate_selected_artifact(NodeStatus::Rejected)?,
             KeyCode::Char('c') => self.complete_current_session()?,
@@ -1664,8 +1729,10 @@ impl InteractiveTuiApp {
         self.pending_provider_tasks += 1;
         self.current_session_id = Some(session_id.clone());
         self.current_session = None;
-        self.artifact_ids.clear();
-        self.artifact_index = 0;
+        self.tree_node_ids.clear();
+        self.tree_selection_index = 0;
+        self.viewer_pane_text = String::from("Session data is loading...");
+        self.viewer_scroll_offset = 0;
         self.screen = InteractiveTuiScreen::SessionView;
         self.start_output_stream_for_session(
             &session_id,
@@ -1711,44 +1778,29 @@ impl InteractiveTuiApp {
         Ok(())
     }
 
-    fn open_artifact_preview(&mut self) -> Result<(), AppError> {
-        let Some(session) = &self.current_session else {
-            return Ok(());
-        };
-        let Some(artifact_id) = self.selected_artifact_id().cloned() else {
-            self.status_message = String::from("No artifact selected");
-            return Ok(());
-        };
-
-        let Some(node) = find_node(session, &artifact_id) else {
-            self.status_message = String::from("Selected artifact node not found");
-            return Ok(());
-        };
-
-        let body = match &node.payload_ref {
-            Some(relative_path) => {
-                let session_id = self.current_session_id.as_ref().ok_or_else(|| {
-                    AppError::InvalidState(String::from("missing current session id"))
-                })?;
-                let payload_path = self.sessions_dir.join(session_id).join(relative_path);
-                fs::read_to_string(&payload_path)
-                    .map_err(|err| AppError::from_io("read artifact payload for preview", err))?
-            }
-            None => String::from("<artifact has no payload reference>"),
+    fn open_selected_node_preview(&mut self) {
+        let Some(node) = self.selected_tree_node() else {
+            self.status_message = String::from("No node selected");
+            return;
         };
 
         self.preview = Some(InteractiveArtifactPreview {
             title: node.id.to_string(),
-            body,
+            body: self.viewer_pane_text.clone(),
         });
-        Ok(())
     }
 
     fn mutate_selected_artifact(&mut self, target_status: NodeStatus) -> Result<(), AppError> {
-        let Some(artifact_id) = self.selected_artifact_id().cloned() else {
-            self.status_message = String::from("No artifact selected");
+        let Some(selected_node) = self.selected_tree_node().cloned() else {
+            self.status_message = String::from("No node selected");
             return Ok(());
         };
+
+        if selected_node.kind != NodeKind::Artifact {
+            self.status_message = String::from("Select an artifact node in the tree first");
+            return Ok(());
+        }
+        let artifact_id = selected_node.id;
 
         let Some(session_id) = &self.current_session_id else {
             return Err(AppError::InvalidState(String::from(
@@ -1816,23 +1868,46 @@ impl InteractiveTuiApp {
     fn refresh_current_session(&mut self) -> Result<(), AppError> {
         let Some(session_id) = &self.current_session_id else {
             self.current_session = None;
-            self.artifact_ids.clear();
+            self.tree_node_ids.clear();
+            self.tree_selection_index = 0;
+            self.viewer_pane_text = String::from("No session selected");
+            self.viewer_scroll_offset = 0;
             return Ok(());
         };
 
+        let previous_selected_node_id = self.selected_tree_node_id().cloned();
         let session_dir = self.sessions_dir.join(session_id);
         let session = read_session_json(&session_dir)
             .map_err(|err| AppError::from_io("reload session", err))?;
-        self.artifact_ids = session
-            .nodes
+
+        let tree_entries = render_tree_entries(&session);
+        self.tree_node_ids = tree_entries
             .iter()
-            .filter(|node| node.kind == NodeKind::Artifact)
-            .map(|node| node.id.clone())
+            .map(|(node_id, _)| node_id.clone())
             .collect();
-        if self.artifact_index >= self.artifact_ids.len() {
-            self.artifact_index = self.artifact_ids.len().saturating_sub(1);
+        if self.tree_node_ids.is_empty() {
+            self.tree_selection_index = 0;
+        } else if let Some(previous_selected_node_id) = previous_selected_node_id {
+            self.tree_selection_index = self
+                .tree_node_ids
+                .iter()
+                .position(|node_id| *node_id == previous_selected_node_id)
+                .or_else(|| {
+                    self.tree_node_ids
+                        .iter()
+                        .position(|node_id| *node_id == session.current_node_id)
+                })
+                .unwrap_or(0);
+        } else {
+            self.tree_selection_index = self
+                .tree_node_ids
+                .iter()
+                .position(|node_id| *node_id == session.current_node_id)
+                .unwrap_or(0);
         }
+
         self.current_session = Some(session);
+        self.refresh_viewer_pane();
 
         Ok(())
     }
@@ -1850,8 +1925,80 @@ impl InteractiveTuiApp {
         Ok(())
     }
 
-    fn selected_artifact_id(&self) -> Option<&NodeId> {
-        self.artifact_ids.get(self.artifact_index)
+    fn selected_tree_node_id(&self) -> Option<&NodeId> {
+        self.tree_node_ids.get(self.tree_selection_index)
+    }
+
+    fn selected_tree_node(&self) -> Option<&SessionNode> {
+        let session = self.current_session.as_ref()?;
+        let node_id = self.selected_tree_node_id()?;
+        find_node(session, node_id)
+    }
+
+    fn refresh_viewer_pane(&mut self) {
+        self.viewer_scroll_offset = 0;
+
+        let Some(session) = self.current_session.as_ref() else {
+            self.viewer_pane_text = String::from("Session data is loading...");
+            return;
+        };
+        let Some(session_id) = self.current_session_id.as_ref() else {
+            self.viewer_pane_text = String::from("No session selected");
+            return;
+        };
+        let Some(node_id) = self.selected_tree_node_id() else {
+            self.viewer_pane_text = String::from("No node selected");
+            return;
+        };
+
+        self.viewer_pane_text =
+            render_selected_node_view(session, &self.sessions_dir.join(session_id), node_id);
+    }
+
+    fn scroll_focused_pane_up(&mut self, lines: usize) {
+        match self.focused_pane {
+            InteractivePaneFocus::Tree => self.scroll_tree_up(lines),
+            InteractivePaneFocus::Viewer => self.scroll_viewer_up(lines),
+            InteractivePaneFocus::Output => self.scroll_output_up(lines),
+        }
+    }
+
+    fn scroll_focused_pane_down(&mut self, lines: usize) {
+        match self.focused_pane {
+            InteractivePaneFocus::Tree => self.scroll_tree_down(lines),
+            InteractivePaneFocus::Viewer => self.scroll_viewer_down(lines),
+            InteractivePaneFocus::Output => self.scroll_output_down(lines),
+        }
+    }
+
+    fn scroll_tree_up(&mut self, lines: usize) {
+        if self.tree_node_ids.is_empty() {
+            return;
+        }
+
+        let node_count = self.tree_node_ids.len();
+        let effective_steps = lines % node_count;
+        self.tree_selection_index =
+            (self.tree_selection_index + node_count - effective_steps) % node_count;
+        self.refresh_viewer_pane();
+    }
+
+    fn scroll_tree_down(&mut self, lines: usize) {
+        if self.tree_node_ids.is_empty() {
+            return;
+        }
+
+        let node_count = self.tree_node_ids.len();
+        self.tree_selection_index = (self.tree_selection_index + lines) % node_count;
+        self.refresh_viewer_pane();
+    }
+
+    fn scroll_viewer_up(&mut self, lines: usize) {
+        self.viewer_scroll_offset = self.viewer_scroll_offset.saturating_sub(lines);
+    }
+
+    fn scroll_viewer_down(&mut self, lines: usize) {
+        self.viewer_scroll_offset = self.viewer_scroll_offset.saturating_add(lines);
     }
 
     fn current_session_output(&self) -> String {
@@ -1937,6 +2084,16 @@ fn resolve_output_scroll_offset(output: &str, panel_height: u16, scroll_from_bot
     let clamped_from_bottom = scroll_from_bottom.min(max_scroll);
     let offset = max_scroll.saturating_sub(clamped_from_bottom);
     offset.try_into().unwrap_or(u16::MAX)
+}
+
+fn resolve_content_scroll_offset(content: &str, panel_height: u16, desired_scroll: usize) -> u16 {
+    let viewport_lines = usize::from(panel_height.saturating_sub(2)).max(1);
+    let total_lines = content.lines().count().max(1);
+    let max_scroll = total_lines.saturating_sub(viewport_lines);
+    desired_scroll
+        .min(max_scroll)
+        .try_into()
+        .unwrap_or(u16::MAX)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -2840,26 +2997,96 @@ fn prompt_input(prompt: &str) -> Result<String, AppError> {
     Ok(line.trim().to_string())
 }
 
-fn render_tree_lines(session: &SessionTree) -> Vec<String> {
-    fn walk(session: &SessionTree, node_id: &NodeId, depth: usize, lines: &mut Vec<String>) {
+fn render_tree_entries(session: &SessionTree) -> Vec<(NodeId, String)> {
+    fn walk(
+        session: &SessionTree,
+        node_id: &NodeId,
+        depth: usize,
+        entries: &mut Vec<(NodeId, String)>,
+    ) {
         if let Some(node) = find_node(session, node_id) {
-            lines.push(format!(
-                "{}- {} [{:?}/{:?}] {}",
-                "  ".repeat(depth),
-                node.id,
-                node.kind,
-                node.status,
-                node.label
+            entries.push((
+                node.id.clone(),
+                format!(
+                    "{}{} [{:?}/{:?}] {}",
+                    "  ".repeat(depth),
+                    node.id,
+                    node.kind,
+                    node.status,
+                    node.label
+                ),
             ));
             for child in &node.children_ids {
-                walk(session, child, depth + 1, lines);
+                walk(session, child, depth + 1, entries);
             }
         }
     }
 
-    let mut lines = Vec::new();
-    walk(session, &session.intent_node_id, 0, &mut lines);
-    lines
+    let mut entries = Vec::new();
+    walk(session, &session.intent_node_id, 0, &mut entries);
+    entries
+}
+
+fn resolve_tree_window_start(
+    selected_index: usize,
+    total_rows: usize,
+    visible_rows: usize,
+) -> usize {
+    if total_rows <= visible_rows {
+        return 0;
+    }
+
+    let max_start = total_rows.saturating_sub(visible_rows);
+    selected_index
+        .saturating_sub(visible_rows / 2)
+        .min(max_start)
+}
+
+fn render_selected_node_view(
+    session: &SessionTree,
+    session_dir: &Path,
+    node_id: &NodeId,
+) -> String {
+    let Some(node) = find_node(session, node_id) else {
+        return String::from("Selected node was not found in session tree");
+    };
+
+    let mut lines = vec![
+        format!("Node: {}", node.id),
+        format!("Kind: {:?}", node.kind),
+        format!("Status: {:?}", node.status),
+        format!("Label: {}", node.label),
+    ];
+
+    if let Some(parent_id) = &node.parent_id {
+        lines.push(format!("Parent: {parent_id}"));
+    }
+
+    if !node.children_ids.is_empty() {
+        let children = node
+            .children_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("Children: {children}"));
+    }
+
+    lines.push(String::new());
+    match &node.payload_ref {
+        Some(relative_path) => {
+            let payload_path = session_dir.join(relative_path);
+            lines.push(format!("Payload path: {}", payload_path.display()));
+            lines.push(String::from("---"));
+            match fs::read_to_string(&payload_path) {
+                Ok(payload) => lines.push(payload),
+                Err(err) => lines.push(format!("<unable to read payload: {err}>")),
+            }
+        }
+        None => lines.push(String::from("<node has no payload>")),
+    }
+
+    lines.join("\n")
 }
 
 fn build_review_rubric(
