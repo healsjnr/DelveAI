@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "session_id": "session-1773283544592",
+  "thread_id": "thread-echo-1773283544592280000",
+  "intent_node_id": "intent-root",
+  "current_node_id": "prompt-1773283982714966000",
+  "state": "Active",
+  "nodes": [
+    {
+      "id": "intent-root",
+      "label": "hello world test",
+      "kind": "Intent",
+      "artifact_kind": null,
+      "status": "Accepted",
+      "parent_id": null,
+      "children_ids": [
+        "prompt-1773283544593449000"
+      ],
+      "input_node_ids": [],
+      "payload_ref": "intent.md"
+    },
+    {
+      "id": "prompt-1773283544593449000",
+      "label": "prompt-hello-world-test-44593926",
+      "kind": "Prompt",
+      "artifact_kind": null,
+      "status": "Accepted",
+      "parent_id": "intent-root",
+      "children_ids": [
+        "artifact-1773283544593450000",
+        "prompt-1773283982714966000"
+      ],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1773283544593449000/prompt.md"
+    },
+    {
+      "id": "artifact-1773283544593450000",
+      "label": "artifact-echo-hello-world-test-44593930",
+      "kind": "Artifact",
+      "artifact_kind": "Implementation",
+      "status": "Proposed",
+      "parent_id": "prompt-1773283544593449000",
+      "children_ids": [],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1773283544593449000/artifacts/artifact-1773283544593450000.md"
+    },
+    {
+      "id": "prompt-1773283982714966000",
+      "label": "prompt-test-prompt-text-82715762",
+      "kind": "Prompt",
+      "artifact_kind": null,
+      "status": "Accepted",
+      "parent_id": "prompt-1773283544593449000",
+      "children_ids": [
+        "artifact-1773283982714967000"
+      ],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1773283982714966000/prompt.md"
+    },
+    {
+      "id": "artifact-1773283982714967000",
+      "label": "artifact-echo-test-prompt-text-82715768",
+      "kind": "Artifact",
+      "artifact_kind": "Implementation",
+      "status": "Proposed",
+      "parent_id": "prompt-1773283982714966000",
+      "children_ids": [],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1773283982714966000/artifacts/artifact-1773283982714967000.md"
+    }
+  ]
+}

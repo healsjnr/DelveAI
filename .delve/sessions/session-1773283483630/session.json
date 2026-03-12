@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "session_id": "session-1773283483630",
+  "thread_id": "T-019cdfee-ac7c-706c-a16f-2b37e948c30f",
+  "intent_node_id": "intent-root",
+  "current_node_id": "prompt-1773283556015597000",
+  "state": "Active",
+  "nodes": [
+    {
+      "id": "intent-root",
+      "label": "Please review the work in ~/DelveAI. Tell me what is required to get the interactive shell version working.",
+      "kind": "Intent",
+      "artifact_kind": null,
+      "status": "Accepted",
+      "parent_id": null,
+      "children_ids": [
+        "prompt-1773283556015597000"
+      ],
+      "input_node_ids": [],
+      "payload_ref": "intent.md"
+    },
+    {
+      "id": "prompt-1773283556015597000",
+      "label": "prompt-please-review-the-work-56016936",
+      "kind": "Prompt",
+      "artifact_kind": null,
+      "status": "Accepted",
+      "parent_id": "intent-root",
+      "children_ids": [
+        "artifact-1773283556015605000"
+      ],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1773283556015597000/prompt.md"
+    },
+    {
+      "id": "artifact-1773283556015605000",
+      "label": "artifact-the-project-builds-tests-56017008",
+      "kind": "Artifact",
+      "artifact_kind": "Implementation",
+      "status": "Proposed",
+      "parent_id": "prompt-1773283556015597000",
+      "children_ids": [],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1773283556015597000/artifacts/artifact-1773283556015605000.md"
+    }
+  ]
+}

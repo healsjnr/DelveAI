@@ -1,0 +1,1 @@
+When I a run a non-interactive command with an intent, everything works except for the last step which is generating a new prompt for the suggested next piece of work. Instead I get the error `error: provider Amp failed with status Some(1):`. Can you please investigate this. DO NOT WRITE ANY CODE. Instead just return summary of what might be causing the error and how to fix it

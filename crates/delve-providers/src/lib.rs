@@ -388,6 +388,9 @@ fn parse_amp_stream_json_line(
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    if entry_type == "user" {
+        emit_user_message_hint(&payload, on_chunk);
+    }
     if entry_type == "assistant" {
         emit_assistant_text_chunks(&payload, on_chunk);
     }
@@ -419,11 +422,53 @@ fn emit_assistant_text_chunks(payload: &Value, on_chunk: &mut dyn FnMut(&str)) {
         return;
     };
 
+    let mut emitted_text = false;
     for content_entry in content_entries {
         if let Some(text) = content_entry.get("text").and_then(Value::as_str) {
             on_chunk(text);
+            emitted_text = true;
         }
     }
+
+    if !emitted_text {
+        let content_types = collect_content_types(content_entries);
+        if !content_types.is_empty() {
+            on_chunk(&content_types.join(","));
+            emitted_text = true;
+        }
+    }
+
+    if emitted_text {
+        on_chunk("\n");
+    }
+}
+
+fn emit_user_message_hint(payload: &Value, on_chunk: &mut dyn FnMut(&str)) {
+    on_chunk("Thinking...");
+
+    let Some(content_entries) = payload
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        on_chunk("\n");
+        return;
+    };
+
+    let content_types = collect_content_types(content_entries);
+    if !content_types.is_empty() {
+        on_chunk(" ");
+        on_chunk(&content_types.join(","));
+    }
+    on_chunk("\n");
+}
+
+fn collect_content_types(content_entries: &[Value]) -> Vec<String> {
+    content_entries
+        .iter()
+        .filter_map(|entry| entry.get("type").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn run_command_provider(
@@ -609,6 +654,14 @@ mod tests {
 
         parse_amp_stream_json_line(
             &ProviderKind::Amp,
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\"},{\"type\":\"text\"}]}}",
+            &mut |chunk| streamed_text.push_str(chunk),
+            &mut final_result,
+            &mut raw_output,
+        )
+        .expect("user message should parse");
+        parse_amp_stream_json_line(
+            &ProviderKind::Amp,
             "{\"type\":\"assistant\",\"message\":{\"content\":[{\"text\":\"First \"},{\"text\":\"second\"}]}}",
             &mut |chunk| streamed_text.push_str(chunk),
             &mut final_result,
@@ -624,8 +677,30 @@ mod tests {
         )
         .expect("result message should parse");
 
-        assert_eq!(streamed_text, "First second");
+        assert_eq!(
+            streamed_text,
+            "Thinking... tool_result,text\nFirst second\n"
+        );
         assert_eq!(final_result.as_deref(), Some("Final artifact"));
+    }
+
+    #[test]
+    fn assistant_messages_without_text_emit_content_types() {
+        let mut streamed_text = String::new();
+        let mut final_result = None;
+        let mut raw_output = String::new();
+
+        parse_amp_stream_json_line(
+            &ProviderKind::Amp,
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\"},{\"type\":\"image\"}]}}",
+            &mut |chunk| streamed_text.push_str(chunk),
+            &mut final_result,
+            &mut raw_output,
+        )
+        .expect("assistant non-text message should parse");
+
+        assert_eq!(streamed_text, "tool_use,image\n");
+        assert!(final_result.is_none());
     }
 
     #[test]

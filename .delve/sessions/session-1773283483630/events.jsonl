@@ -1,0 +1,1 @@
+{"schema_version":1,"event_kind":"session_created","session_id":"session-1773283483630","node_id":"intent-root","timestamp_ms":1773283487435,"metadata":{"intent":"Please review the work in ~/DelveAI. Tell me what is required to get the interactive shell version working.","provider":"amp","thread_id":"T-019cdfee-ac7c-706c-a16f-2b37e948c30f"}}

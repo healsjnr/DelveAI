@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "session_id": "session-1773284369139",
+  "thread_id": "T-019cdffc-2d5e-716c-a290-b827bed4da74",
+  "intent_node_id": "intent-root",
+  "current_node_id": "prompt-1773284450526814000",
+  "state": "Active",
+  "nodes": [
+    {
+      "id": "intent-root",
+      "label": "When I a run a non-interactive command with an intent, everything works except for the last step which is generating a new prompt for the suggested next piece of work. Instead I get the error `error: provider Amp failed with status Some(1):`. Can you please investigate this. DO NOT WRITE ANY CODE. Instead just return summary of what might be causing the error and how to fix it",
+      "kind": "Intent",
+      "artifact_kind": null,
+      "status": "Accepted",
+      "parent_id": null,
+      "children_ids": [
+        "prompt-1773284450526814000"
+      ],
+      "input_node_ids": [],
+      "payload_ref": "intent.md"
+    },
+    {
+      "id": "prompt-1773284450526814000",
+      "label": "prompt-when-i-a-run-50528110",
+      "kind": "Prompt",
+      "artifact_kind": null,
+      "status": "Accepted",
+      "parent_id": "intent-root",
+      "children_ids": [
+        "artifact-1773284450526823000"
+      ],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1773284450526814000/prompt.md"
+    },
+    {
+      "id": "artifact-1773284450526823000",
+      "label": "artifact-now-i-have-a-50528211",
+      "kind": "Artifact",
+      "artifact_kind": "Implementation",
+      "status": "Proposed",
+      "parent_id": "prompt-1773284450526814000",
+      "children_ids": [],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1773284450526814000/artifacts/artifact-1773284450526823000.md"
+    }
+  ]
+}

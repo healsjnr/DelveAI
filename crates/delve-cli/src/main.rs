@@ -1026,15 +1026,20 @@ fn run_session_interactive(
     runtime: &RuntimeConfig,
 ) -> Result<(), AppError> {
     let sessions_dir = args.sessions_dir.unwrap_or_else(default_sessions_dir);
-    let session_id = match args.session {
+    let mut session_id = match args.session {
         Some(session) => session,
-        None => pick_recent_session(&sessions_dir)?,
+        None => match choose_interactive_session(&sessions_dir)? {
+            InteractiveSessionSelection::Existing(session_id) => session_id,
+            InteractiveSessionSelection::CreateNew => {
+                create_interactive_intent_session(args.provider, &sessions_dir, runtime)?
+            }
+        },
     };
-    let session_dir = sessions_dir.join(&session_id);
 
     runtime.text_line(format!("Launching interactive session '{session_id}'"));
 
     loop {
+        let session_dir = sessions_dir.join(&session_id);
         let session = read_session_json(&session_dir)
             .map_err(|err| AppError::from_io("load session for interactive mode", err))?;
         if !runtime.quiet {
@@ -1044,7 +1049,7 @@ fn run_session_interactive(
             for line in render_tree_lines(&session) {
                 println!("{line}");
             }
-            println!("Actions: [p]rompt [b]rowse artifacts [s]how artifact [a]ccept [r]eject [c]omplete [q]uit");
+            println!("Actions: [p]rompt [n]ew intent [b]rowse artifacts [s]how artifact [a]ccept [r]eject [c]omplete [q]uit");
         }
 
         let action = prompt_input("interactive> ")?.to_lowercase();
@@ -1062,6 +1067,11 @@ fn run_session_interactive(
                         runtime,
                     )?;
                 }
+            }
+            "n" | "new" | "new-intent" => {
+                session_id =
+                    create_interactive_intent_session(args.provider, &sessions_dir, runtime)?;
+                runtime.text_line(format!("Switched to session '{session_id}'"));
             }
             "b" | "browse" => {
                 render_artifact_panel(&session, runtime);
@@ -1759,36 +1769,97 @@ fn default_sessions_dir() -> PathBuf {
     PathBuf::from(".delve/sessions")
 }
 
-fn pick_recent_session(sessions_dir: &Path) -> Result<String, AppError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InteractiveSessionSelection {
+    Existing(String),
+    CreateNew,
+}
+
+fn choose_interactive_session(
+    sessions_dir: &Path,
+) -> Result<InteractiveSessionSelection, AppError> {
     let summaries = load_session_summaries(sessions_dir)?;
+
     if summaries.is_empty() {
-        return Err(AppError::NotFound(format!(
-            "no sessions found in '{}'",
-            sessions_dir.display()
+        println!("No sessions found in '{}'.", sessions_dir.display());
+    } else {
+        println!("Recent sessions:");
+        for (idx, summary) in summaries.iter().take(10).enumerate() {
+            println!(
+                "  {}: {} [{}] {}",
+                idx + 1,
+                summary.session_id,
+                summary.thread_id,
+                summary.intent_label
+            );
+        }
+    }
+    println!("  n: create new intent session");
+
+    let choice = prompt_input("Select session number or 'n'> ")?;
+    resolve_interactive_session_choice(&choice, &summaries)
+}
+
+fn resolve_interactive_session_choice(
+    choice: &str,
+    summaries: &[SessionSummary],
+) -> Result<InteractiveSessionSelection, AppError> {
+    let normalized = choice.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "n" | "new" | "create") {
+        return Ok(InteractiveSessionSelection::CreateNew);
+    }
+
+    if summaries.is_empty() {
+        return Err(AppError::InvalidState(String::from(
+            "no sessions available; enter 'n' to create a new intent session",
         )));
     }
 
-    println!("Recent sessions:");
-    for (idx, summary) in summaries.iter().take(10).enumerate() {
-        println!(
-            "  {}: {} [{:?}] {}",
-            idx + 1,
-            summary.session_id,
-            summary.state,
-            summary.intent_label
-        );
-    }
-
-    let choice = prompt_input("Select session number> ")?;
-    let index = choice
-        .trim()
+    let index = normalized
         .parse::<usize>()
         .map_err(|_| AppError::InvalidState(String::from("invalid session picker input")))?;
     let selected = summaries.get(index.saturating_sub(1)).ok_or_else(|| {
         AppError::InvalidState(String::from("selected session index is out of range"))
     })?;
 
-    Ok(selected.session_id.clone())
+    Ok(InteractiveSessionSelection::Existing(
+        selected.session_id.clone(),
+    ))
+}
+
+fn most_recent_session_id(sessions_dir: &Path) -> Result<String, AppError> {
+    let summaries = load_session_summaries(sessions_dir)?;
+    summaries
+        .first()
+        .map(|summary| summary.session_id.clone())
+        .ok_or_else(|| {
+            AppError::NotFound(format!("no sessions found in '{}'", sessions_dir.display()))
+        })
+}
+
+fn create_interactive_intent_session(
+    provider: ProviderCli,
+    sessions_dir: &Path,
+    runtime: &RuntimeConfig,
+) -> Result<String, AppError> {
+    loop {
+        let intent = compose_prompt()?;
+        if intent.trim().is_empty() {
+            runtime.text_line("Intent cannot be empty");
+            continue;
+        }
+
+        run_session_create(
+            SessionCreateArgs {
+                intent,
+                provider,
+                sessions_dir: Some(sessions_dir.to_path_buf()),
+            },
+            runtime,
+        )?;
+
+        return most_recent_session_id(sessions_dir);
+    }
 }
 
 fn prompt_input(prompt: &str) -> Result<String, AppError> {
@@ -2010,8 +2081,9 @@ mod tests {
 
     use super::{
         load_auto_resume_state, load_session_summaries, looks_like_amp_thread_id,
-        session_thread_id_requires_refresh, ArtifactCommand, Cli, Command, InterruptController,
-        ProviderCli, SessionCheckpoint, SessionCommand, SessionState,
+        resolve_interactive_session_choice, session_thread_id_requires_refresh, ArtifactCommand,
+        Cli, Command, InteractiveSessionSelection, InterruptController, ProviderCli,
+        SessionCheckpoint, SessionCommand, SessionState, SessionSummary,
     };
 
     #[test]
@@ -2144,6 +2216,44 @@ mod tests {
             ProviderCli::Echo,
             "thread-echo-123"
         ));
+    }
+
+    #[test]
+    fn interactive_session_selector_supports_create_new_option() {
+        let selection = resolve_interactive_session_choice("n", &[])
+            .expect("new option should be accepted when no sessions exist");
+
+        assert_eq!(selection, InteractiveSessionSelection::CreateNew);
+    }
+
+    #[test]
+    fn interactive_session_selector_resolves_existing_session_index() {
+        let summaries = vec![
+            SessionSummary {
+                session_id: String::from("session-200"),
+                thread_id: String::from("T-12345678-1234-1234-1234-1234567890ab"),
+                state: SessionState::Active,
+                current_node_id: String::from("prompt-2"),
+                intent_label: String::from("Newer intent"),
+                node_count: 4,
+            },
+            SessionSummary {
+                session_id: String::from("session-100"),
+                thread_id: String::from("thread-echo-legacy"),
+                state: SessionState::Completed,
+                current_node_id: String::from("prompt-1"),
+                intent_label: String::from("Older intent"),
+                node_count: 2,
+            },
+        ];
+
+        let selection = resolve_interactive_session_choice("2", &summaries)
+            .expect("second session should resolve");
+
+        assert_eq!(
+            selection,
+            InteractiveSessionSelection::Existing(String::from("session-100"))
+        );
     }
 
     fn unique_test_dir(label: &str) -> std::path::PathBuf {
