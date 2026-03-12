@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1073,6 +1075,22 @@ struct InteractiveArtifactPreview {
     body: String,
 }
 
+#[derive(Clone, Debug)]
+enum InteractiveWorkerEvent {
+    StreamChunk {
+        session_id: String,
+        chunk: String,
+    },
+    SessionTaskFinished {
+        session_id: String,
+        status_message: String,
+    },
+    SessionTaskFailed {
+        session_id: Option<String>,
+        error_message: String,
+    },
+}
+
 struct InteractiveTuiApp {
     provider: ProviderCli,
     sessions_dir: PathBuf,
@@ -1086,6 +1104,10 @@ struct InteractiveTuiApp {
     artifact_index: usize,
     input_dialog: Option<InteractiveTuiInputDialog>,
     preview: Option<InteractiveArtifactPreview>,
+    stream_output_by_session: HashMap<String, String>,
+    pending_provider_tasks: usize,
+    worker_tx: Sender<InteractiveWorkerEvent>,
+    worker_rx: Receiver<InteractiveWorkerEvent>,
     status_message: String,
     should_quit: bool,
 }
@@ -1097,6 +1119,7 @@ impl InteractiveTuiApp {
         runtime: RuntimeConfig,
         initial_session: Option<String>,
     ) -> Result<Self, AppError> {
+        let (worker_tx, worker_rx) = mpsc::channel();
         let mut app = Self {
             provider,
             sessions_dir,
@@ -1110,6 +1133,10 @@ impl InteractiveTuiApp {
             artifact_index: 0,
             input_dialog: None,
             preview: None,
+            stream_output_by_session: HashMap::new(),
+            pending_provider_tasks: 0,
+            worker_tx,
+            worker_rx,
             status_message: String::from("Ready"),
             should_quit: false,
         };
@@ -1148,6 +1175,7 @@ impl InteractiveTuiApp {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<(), AppError> {
         while !self.should_quit {
+            self.process_worker_events()?;
             terminal
                 .draw(|frame| self.draw(frame))
                 .map_err(|err| AppError::from_io("draw interactive tui", err))?;
@@ -1159,6 +1187,42 @@ impl InteractiveTuiApp {
                     .map_err(|err| AppError::from_io("read interactive event", err))?;
                 if let Event::Key(key_event) = event_value {
                     self.handle_key_event(key_event)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_worker_events(&mut self) -> Result<(), AppError> {
+        while let Ok(event) = self.worker_rx.try_recv() {
+            match event {
+                InteractiveWorkerEvent::StreamChunk { session_id, chunk } => {
+                    self.stream_output_by_session
+                        .entry(session_id)
+                        .or_default()
+                        .push_str(&chunk);
+                }
+                InteractiveWorkerEvent::SessionTaskFinished {
+                    session_id,
+                    status_message,
+                } => {
+                    self.pending_provider_tasks = self.pending_provider_tasks.saturating_sub(1);
+                    self.refresh_session_summaries()?;
+                    self.switch_to_session(session_id)?;
+                    self.status_message = status_message;
+                }
+                InteractiveWorkerEvent::SessionTaskFailed {
+                    session_id,
+                    error_message,
+                } => {
+                    self.pending_provider_tasks = self.pending_provider_tasks.saturating_sub(1);
+                    self.status_message =
+                        format!("Background provider task failed: {error_message}");
+                    if let Some(session_id) = session_id {
+                        self.current_session_id = Some(session_id);
+                        self.screen = InteractiveTuiScreen::SessionView;
+                    }
                 }
             }
         }
@@ -1230,20 +1294,12 @@ impl InteractiveTuiApp {
     }
 
     fn draw_session_view(&self, frame: &mut ratatui::Frame<'_>) {
-        let Some(session) = &self.current_session else {
-            frame.render_widget(
-                Paragraph::new("No session selected")
-                    .block(Block::default().title("Session").borders(Borders::ALL)),
-                frame.area(),
-            );
-            return;
-        };
-
         let root_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(8),
+                Constraint::Length(8),
                 Constraint::Length(3),
             ])
             .split(frame.area());
@@ -1252,19 +1308,31 @@ impl InteractiveTuiApp {
             .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
             .split(root_layout[1]);
 
-        frame.render_widget(
-            Paragraph::new(format!(
+        let header_text = if let Some(session) = &self.current_session {
+            format!(
                 "Session {} [{:?}] thread={} current={}",
                 session.session_id, session.state, session.thread_id, session.current_node_id
-            ))
-            .block(Block::default().title("Session").borders(Borders::ALL)),
+            )
+        } else if let Some(session_id) = &self.current_session_id {
+            format!("Session {session_id} [loading]")
+        } else {
+            String::from("No session selected")
+        };
+
+        frame.render_widget(
+            Paragraph::new(header_text)
+                .block(Block::default().title("Session").borders(Borders::ALL)),
             root_layout[0],
         );
 
-        let tree_items = render_tree_lines(session)
-            .into_iter()
-            .map(ListItem::new)
-            .collect::<Vec<_>>();
+        let tree_items = if let Some(session) = &self.current_session {
+            render_tree_lines(session)
+                .into_iter()
+                .map(ListItem::new)
+                .collect::<Vec<_>>()
+        } else {
+            vec![ListItem::new("Session data is loading...")]
+        };
         frame.render_widget(
             List::new(tree_items).block(Block::default().title("Tree").borders(Borders::ALL)),
             body_layout[0],
@@ -1275,7 +1343,10 @@ impl InteractiveTuiApp {
             .iter()
             .enumerate()
             .map(|(index, artifact_id)| {
-                let node = find_node(session, artifact_id);
+                let node = self
+                    .current_session
+                    .as_ref()
+                    .and_then(|session| find_node(session, artifact_id));
                 let text = if let Some(node) = node {
                     format!("{} [{:?}] {}", node.id, node.status, node.label)
                 } else {
@@ -1298,14 +1369,32 @@ impl InteractiveTuiApp {
             body_layout[1],
         );
 
+        let session_stream_output = self
+            .current_session_id
+            .as_ref()
+            .and_then(|session_id| self.stream_output_by_session.get(session_id))
+            .cloned()
+            .unwrap_or_else(|| String::from("No provider output yet"));
+        frame.render_widget(
+            Paragraph::new(session_stream_output)
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title("Current Session Output")
+                        .borders(Borders::ALL),
+                ),
+            root_layout[2],
+        );
+
         frame.render_widget(
             Paragraph::new(format!(
-                "p: prompt | n: new intent | s: show artifact | a/r: accept/reject | c: complete | o: sessions | q: quit  [{}]",
+                "p: prompt | n: new intent | s: show artifact | a/r: accept/reject | c: complete | o: sessions | q: quit | running={}  [{}]",
+                self.pending_provider_tasks,
                 self.status_message
             ))
             .wrap(Wrap { trim: true })
             .block(Block::default().title("Help").borders(Borders::ALL)),
-            root_layout[2],
+            root_layout[3],
         );
     }
 
@@ -1492,34 +1581,109 @@ impl InteractiveTuiApp {
             )));
         };
 
-        run_session_continue(
-            SessionContinueArgs {
-                session: session_id.clone(),
-                prompt,
-                provider: self.provider,
-                sessions_dir: Some(self.sessions_dir.clone()),
-            },
-            &self.quiet_runtime(),
-        )?;
-        self.refresh_current_session()?;
-        self.status_message = String::from("Prompt executed");
+        if self.pending_provider_tasks > 0 {
+            self.status_message =
+                String::from("A provider task is already running. Wait for it to finish.");
+            return Ok(());
+        }
+
+        self.pending_provider_tasks += 1;
+        let session_id = session_id.clone();
+        self.stream_output_by_session
+            .insert(session_id.clone(), String::new());
+        self.status_message = format!("Started prompt execution for '{session_id}'");
+
+        let provider = self.provider;
+        let sessions_dir = self.sessions_dir.clone();
+        let worker_tx = self.worker_tx.clone();
+        std::thread::spawn(move || {
+            let mut on_chunk = |chunk: &str| {
+                let _ = worker_tx.send(InteractiveWorkerEvent::StreamChunk {
+                    session_id: session_id.clone(),
+                    chunk: chunk.to_string(),
+                });
+            };
+
+            match run_session_continue_in_background(
+                &session_id,
+                &prompt,
+                provider,
+                &sessions_dir,
+                &mut on_chunk,
+            ) {
+                Ok(suggested_next_prompt) => {
+                    let _ = worker_tx.send(InteractiveWorkerEvent::SessionTaskFinished {
+                        session_id,
+                        status_message: format!(
+                            "Prompt finished. Suggested next prompt: {suggested_next_prompt}"
+                        ),
+                    });
+                }
+                Err(err) => {
+                    let _ = worker_tx.send(InteractiveWorkerEvent::SessionTaskFailed {
+                        session_id: Some(session_id),
+                        error_message: err.to_string(),
+                    });
+                }
+            }
+        });
+
         Ok(())
     }
 
     fn create_new_intent(&mut self, intent: String) -> Result<(), AppError> {
-        run_session_create(
-            SessionCreateArgs {
-                intent,
-                provider: self.provider,
-                sessions_dir: Some(self.sessions_dir.clone()),
-            },
-            &self.quiet_runtime(),
-        )?;
+        if self.pending_provider_tasks > 0 {
+            self.status_message =
+                String::from("A provider task is already running. Wait for it to finish.");
+            return Ok(());
+        }
 
-        let new_session_id = most_recent_session_id(&self.sessions_dir)?;
-        self.refresh_session_summaries()?;
-        self.switch_to_session(new_session_id)?;
-        self.status_message = String::from("Created and switched to new session");
+        let session_id = build_session_id();
+        self.pending_provider_tasks += 1;
+        self.current_session_id = Some(session_id.clone());
+        self.current_session = None;
+        self.artifact_ids.clear();
+        self.artifact_index = 0;
+        self.screen = InteractiveTuiScreen::SessionView;
+        self.stream_output_by_session
+            .insert(session_id.clone(), String::new());
+        self.status_message = format!("Creating new session '{session_id}'");
+
+        let provider = self.provider;
+        let sessions_dir = self.sessions_dir.clone();
+        let worker_tx = self.worker_tx.clone();
+        std::thread::spawn(move || {
+            let mut on_chunk = |chunk: &str| {
+                let _ = worker_tx.send(InteractiveWorkerEvent::StreamChunk {
+                    session_id: session_id.clone(),
+                    chunk: chunk.to_string(),
+                });
+            };
+
+            match run_session_create_in_background(
+                &session_id,
+                &intent,
+                provider,
+                &sessions_dir,
+                &mut on_chunk,
+            ) {
+                Ok(suggested_next_prompt) => {
+                    let _ = worker_tx.send(InteractiveWorkerEvent::SessionTaskFinished {
+                        session_id,
+                        status_message: format!(
+                            "Intent created. Suggested next prompt: {suggested_next_prompt}"
+                        ),
+                    });
+                }
+                Err(err) => {
+                    let _ = worker_tx.send(InteractiveWorkerEvent::SessionTaskFailed {
+                        session_id: Some(session_id),
+                        error_message: err.to_string(),
+                    });
+                }
+            }
+        });
+
         Ok(())
     }
 
@@ -1684,6 +1848,193 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1]);
 
     horizontal[1]
+}
+
+fn run_session_create_in_background(
+    session_id: &str,
+    intent_text: &str,
+    provider: ProviderCli,
+    sessions_dir: &Path,
+    on_chunk: &mut dyn FnMut(&str),
+) -> Result<String, AppError> {
+    let mut session = SessionTree::new(intent_text.to_string());
+    session.session_id = SessionId::from(session_id.to_string());
+    session.thread_id = create_thread_id_for_provider(provider)?;
+
+    let session_dir = sessions_dir.join(session_id);
+
+    fs::create_dir_all(&session_dir)
+        .map_err(|err| AppError::from_io("create session directory", err))?;
+    let _lock = acquire_session_lock(&session_dir)
+        .map_err(|err| AppError::from_io("acquire session lock", err))?;
+
+    fs::write(session_dir.join("intent.md"), intent_text)
+        .map_err(|err| AppError::from_io("write intent payload", err))?;
+
+    append_event(
+        &session_dir,
+        SessionEventKind::SessionCreated,
+        &session.session_id,
+        Some(session.intent_node_id.clone()),
+        json!({"provider":provider, "intent":intent_text, "thread_id":session.thread_id.clone()}),
+    )?;
+
+    let artifact_response = execute_provider_prompt_streaming_with_callback(
+        provider,
+        &session.thread_id,
+        intent_text,
+        on_chunk,
+    )?;
+    if let Some(thread_id) = artifact_response.thread_id.clone() {
+        session.thread_id = thread_id;
+    }
+    let artifact_output = artifact_response.output;
+
+    let intent_node_id = session.intent_node_id.clone();
+    let generated = append_generated_prompt_and_artifact(
+        &mut session,
+        &session_dir,
+        &intent_node_id,
+        intent_text,
+        &artifact_output,
+    )?;
+    session.current_node_id = generated.prompt_node_id.clone();
+
+    validate_session(&session)?;
+    write_session_json(&session_dir, &session)
+        .map_err(|err| AppError::from_io("write session json", err))?;
+
+    let suggestion = suggest_next_prompt_for_provider(provider, &session.thread_id)?;
+    if let Some(thread_id) = suggestion.thread_id.clone() {
+        session.thread_id = thread_id;
+    }
+    write_session_json(&session_dir, &session)
+        .map_err(|err| AppError::from_io("write session json", err))?;
+
+    append_event(
+        &session_dir,
+        SessionEventKind::PromptAdded,
+        &session.session_id,
+        Some(generated.prompt_node_id.clone()),
+        json!({"from":"session_create"}),
+    )?;
+    append_event(
+        &session_dir,
+        SessionEventKind::ArtifactProposed,
+        &session.session_id,
+        Some(generated.artifact_node_id.clone()),
+        json!({"provider":provider, "prompt":intent_text, "thread_id":session.thread_id.clone()}),
+    )?;
+    append_event(
+        &session_dir,
+        SessionEventKind::OrchestrationDecision,
+        &session.session_id,
+        Some(generated.prompt_node_id),
+        json!({
+            "stage":"suggest_next_prompt",
+            "next_prompt":suggestion.next_prompt.clone(),
+            "artifacts":suggestion.artifacts.clone(),
+            "thread_id":session.thread_id.clone()
+        }),
+    )?;
+
+    Ok(suggestion.next_prompt)
+}
+
+fn run_session_continue_in_background(
+    session_id: &str,
+    prompt: &str,
+    provider: ProviderCli,
+    sessions_dir: &Path,
+    on_chunk: &mut dyn FnMut(&str),
+) -> Result<String, AppError> {
+    let session_dir = sessions_dir.join(session_id);
+    let _lock = acquire_session_lock(&session_dir)
+        .map_err(|err| AppError::from_io("acquire session lock", err))?;
+    let mut session = read_session_json(&session_dir)
+        .map_err(|err| AppError::from_io("load session for continue", err))?;
+    ensure_session_thread_id(provider, &mut session)?;
+
+    let artifact_response = execute_provider_prompt_streaming_with_callback(
+        provider,
+        &session.thread_id,
+        prompt,
+        on_chunk,
+    )?;
+    if let Some(thread_id) = artifact_response.thread_id.clone() {
+        session.thread_id = thread_id;
+    }
+    let artifact_output = artifact_response.output;
+
+    let parent_node_id = session.current_node_id.clone();
+    let generated = append_generated_prompt_and_artifact(
+        &mut session,
+        &session_dir,
+        &parent_node_id,
+        prompt,
+        &artifact_output,
+    )?;
+    session.current_node_id = generated.prompt_node_id.clone();
+
+    validate_session(&session)?;
+    write_session_json(&session_dir, &session)
+        .map_err(|err| AppError::from_io("write session json", err))?;
+
+    let suggestion = suggest_next_prompt_for_provider(provider, &session.thread_id)?;
+    if let Some(thread_id) = suggestion.thread_id.clone() {
+        session.thread_id = thread_id;
+    }
+    write_session_json(&session_dir, &session)
+        .map_err(|err| AppError::from_io("write session json", err))?;
+
+    append_event(
+        &session_dir,
+        SessionEventKind::PromptAdded,
+        &session.session_id,
+        Some(generated.prompt_node_id.clone()),
+        json!({"from":"session_continue"}),
+    )?;
+    append_event(
+        &session_dir,
+        SessionEventKind::ArtifactProposed,
+        &session.session_id,
+        Some(generated.artifact_node_id.clone()),
+        json!({"provider":provider, "prompt":prompt, "thread_id":session.thread_id.clone()}),
+    )?;
+    append_event(
+        &session_dir,
+        SessionEventKind::OrchestrationDecision,
+        &session.session_id,
+        Some(generated.prompt_node_id),
+        json!({
+            "stage":"suggest_next_prompt",
+            "next_prompt":suggestion.next_prompt.clone(),
+            "artifacts":suggestion.artifacts.clone(),
+            "thread_id":session.thread_id.clone()
+        }),
+    )?;
+
+    Ok(suggestion.next_prompt)
+}
+
+fn execute_provider_prompt_streaming_with_callback(
+    provider: ProviderCli,
+    thread_id: &str,
+    prompt: &str,
+    on_chunk: &mut dyn FnMut(&str),
+) -> Result<ProviderResponse, AppError> {
+    match provider {
+        ProviderCli::Amp => {
+            generate_artifact_streaming_with_thread(&AmpProvider, prompt, thread_id, on_chunk)
+        }
+        ProviderCli::Claude => {
+            generate_artifact_streaming_with_thread(&ClaudeProvider, prompt, thread_id, on_chunk)
+        }
+        ProviderCli::Echo => {
+            generate_artifact_streaming_with_thread(&EchoProvider, prompt, thread_id, on_chunk)
+        }
+    }
+    .map_err(AppError::from)
 }
 
 fn run_session_auto(args: SessionAutoArgs, runtime: &RuntimeConfig) -> Result<(), AppError> {
@@ -2324,16 +2675,6 @@ fn build_label(prefix: &str, value: &str) -> String {
 
 fn default_sessions_dir() -> PathBuf {
     PathBuf::from(".delve/sessions")
-}
-
-fn most_recent_session_id(sessions_dir: &Path) -> Result<String, AppError> {
-    let summaries = load_session_summaries(sessions_dir)?;
-    summaries
-        .first()
-        .map(|summary| summary.session_id.clone())
-        .ok_or_else(|| {
-            AppError::NotFound(format!("no sessions found in '{}'", sessions_dir.display()))
-        })
 }
 
 fn prompt_input(prompt: &str) -> Result<String, AppError> {
