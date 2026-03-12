@@ -36,6 +36,13 @@ delve session interactive --provider echo
 delve session auto --session <session-id> --provider echo --max-steps 5
 ```
 
+Thread behavior:
+
+1. Every session/intent persists a single `thread_id` in `session.json`.
+2. All prompt executions in that session reuse the same `thread_id`.
+3. With `--provider amp`, Delve creates the thread using `amp threads new` and executes prompts via `amp threads continue <thread_id> -x ...`.
+4. Suggested next prompts are provider-driven and executed against the same session thread context.
+
 Shell completions:
 
 ```sh

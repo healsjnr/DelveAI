@@ -172,6 +172,7 @@ pub enum ValidationError {
         child_id: NodeId,
         child_kind: NodeKind,
     },
+    MissingThreadId,
 }
 
 impl NodeStatus {
@@ -215,6 +216,8 @@ pub struct SessionNode {
 pub struct SessionTree {
     pub schema_version: u32,
     pub session_id: SessionId,
+    #[serde(default = "default_thread_id")]
+    pub thread_id: String,
     pub intent_node_id: NodeId,
     pub current_node_id: NodeId,
     pub state: SessionState,
@@ -240,6 +243,7 @@ impl SessionTree {
         Self {
             schema_version: 1,
             session_id: SessionId::from("session-local"),
+            thread_id: default_thread_id(),
             intent_node_id: intent_id.clone(),
             current_node_id: intent_id,
             state: SessionState::Active,
@@ -248,6 +252,10 @@ impl SessionTree {
     }
 
     pub fn validate_tree_invariants(&self) -> Result<(), ValidationError> {
+        if self.thread_id.trim().is_empty() {
+            return Err(ValidationError::MissingThreadId);
+        }
+
         let mut node_map: HashMap<&str, &SessionNode> = HashMap::with_capacity(self.nodes.len());
         for node in &self.nodes {
             if node_map.insert(node.id.as_str(), node).is_some() {
@@ -505,6 +513,10 @@ pub fn is_valid_status_transition(from: NodeStatus, to: NodeStatus) -> bool {
     from.can_transition_to(to)
 }
 
+fn default_thread_id() -> String {
+    String::from("thread-unset")
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -532,6 +544,7 @@ mod tests {
         SessionTree {
             schema_version: 1,
             session_id: SessionId::from("session-1"),
+            thread_id: String::from("thread-1"),
             intent_node_id: NodeId::from("intent-1"),
             current_node_id: NodeId::from("prompt-2"),
             state: SessionState::Active,
@@ -781,6 +794,17 @@ mod tests {
                 NodeId::from("artifact-sibling-accepted"),
                 NodeId::from("artifact-1"),
             ]
+        );
+    }
+
+    #[test]
+    fn rejects_session_without_thread_id() {
+        let mut session = valid_session_tree();
+        session.thread_id.clear();
+
+        assert_eq!(
+            session.validate_tree_invariants(),
+            Err(ValidationError::MissingThreadId)
         );
     }
 

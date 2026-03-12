@@ -20,8 +20,12 @@ The format follows Keep a Changelog principles and Semantic Versioning intent.
 2. Stable CLI exit codes are enforced for usage, not found, conflict, validation, provider, and interrupt conditions.
 3. Session create/continue/auto flows now append orchestration decision metadata to `events.jsonl`.
 4. Interactive (`session interactive`) and auto-interactive (`session auto`) terminal workflows were added.
+5. Sessions now persist a single intent `thread_id`, and all prompts in that intent tree execute on the same provider thread.
+6. Amp provider now creates a new thread with `amp threads new` for intent creation and executes prompts with `amp threads continue <thread_id> -x`.
+7. Next-prompt suggestions are now provider-driven and thread-aware, using the session thread context.
 
 ### Fixed
+1. AMP provider flows now refresh incompatible legacy session `thread_id` values before continue/auto execution so artifact generation and next-prompt suggestions always run through valid AMP threads.
 
 ### Removed
 

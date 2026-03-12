@@ -91,6 +91,7 @@ Tasks:
 - [x] Implement `current_node` update rules.
 - [x] Implement helper to compute active lineage.
 - [x] Implement helper to resolve eligible context nodes, including accepted sibling artifacts for continuation prompts.
+- [x] Add session-level Thread ID and require it for valid intent/session state.
 - [x] Add property-based tests for tree invariants.
 - [x] Add unit tests for transition constraints.
 - [x] Add golden fixtures for valid and invalid trees, including prompt-to-prompt continuation cases.
@@ -142,12 +143,15 @@ Tasks:
 - [x] Implement review executor stage.
 - [x] Implement confidence threshold decision gate.
 - [x] Implement next-prompt suggestion stage.
+- [x] Extend provider contracts to support provider-managed thread lifecycle and thread-bound prompts.
+- [x] Implement provider-driven next prompt suggestion by querying the provider with session thread context.
 - [x] Persist orchestration decision metadata to events log.
 - [x] Add end-to-end tests using mock provider fixtures.
 - [x] Add failure-path tests for provider timeout/error handling.
 - [x] Implement Amp provider adapter in `delve-providers` using `amp -x` execution mode.
 - [x] Implement Claude provider adapter in `delve-providers` using `claude -p` execution mode.
 - [x] Implement streaming support for Amp provider adapter.
+- [x] Switch Amp prompt execution to `amp threads continue --stream-json`, streaming `assistant` `message.content[*].text` entries and taking the artifact from the final `result` entry.
 - [x] Implement streaming support for Claude provider adapter.
 
 Phase exit criteria:
@@ -181,6 +185,8 @@ Tasks:
 - [x] Add integration tests for all non-interactive commands.
 - [x] Add integration tests for provider-backed `session create` and `session continue`, including streamed output behavior.
 - [x] Add shell completion generation.
+- [x] Persist intent Thread ID on create and reuse the same Thread ID for all prompt execution in the intent tree.
+- [x] For Amp provider, create a new Amp thread at intent creation and execute all prompts using `amp threads continue <thread_id> -x`.
 
 Phase exit criteria:
 1. All required non-interactive workflows run in CI.

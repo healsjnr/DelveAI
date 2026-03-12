@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "session_id": "session-1773281860928",
+  "thread_id": "T-019cdfd5-ea17-70d8-9053-5607da415aad",
+  "intent_node_id": "intent-root",
+  "current_node_id": "prompt-1773281888294898000",
+  "state": "Active",
+  "nodes": [
+    {
+      "id": "intent-root",
+      "label": "Review the files in ~/DelveAI and summarise what this does",
+      "kind": "Intent",
+      "artifact_kind": null,
+      "status": "Accepted",
+      "parent_id": null,
+      "children_ids": [
+        "prompt-1773281888294898000"
+      ],
+      "input_node_ids": [],
+      "payload_ref": "intent.md"
+    },
+    {
+      "id": "prompt-1773281888294898000",
+      "label": "prompt-review-the-files-in-88296213",
+      "kind": "Prompt",
+      "artifact_kind": null,
+      "status": "Accepted",
+      "parent_id": "intent-root",
+      "children_ids": [
+        "artifact-1773281888294905000"
+      ],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1773281888294898000/prompt.md"
+    },
+    {
+      "id": "artifact-1773281888294905000",
+      "label": "artifact-delveai-is-a-cli-88296276",
+      "kind": "Artifact",
+      "artifact_kind": "Implementation",
+      "status": "Proposed",
+      "parent_id": "prompt-1773281888294898000",
+      "children_ids": [],
+      "input_node_ids": [],
+      "payload_ref": "prompts/prompt-1773281888294898000/artifacts/artifact-1773281888294905000.md"
+    }
+  ]
+}

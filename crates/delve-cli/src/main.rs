@@ -16,8 +16,12 @@ use clap_complete::{generate, Shell};
 use delve_domain::{
     ArtifactKind, NodeId, NodeKind, NodeStatus, SessionId, SessionNode, SessionState, SessionTree,
 };
-use delve_orchestrator::{execute_review, generate_artifact_streaming, suggest_next_prompt};
-use delve_providers::{AmpProvider, ClaudeProvider, EchoProvider, ProviderError};
+use delve_orchestrator::{
+    execute_review, generate_artifact_streaming_with_thread, suggest_next_prompt_with_provider,
+};
+use delve_providers::{
+    AmpProvider, ClaudeProvider, CompletionProvider, EchoProvider, ProviderError, ProviderResponse,
+};
 use delve_storage::{
     acquire_session_lock, append_session_event, clear_session_checkpoint, read_session_checkpoint,
     read_session_events, read_session_json, session_file_path, write_session_checkpoint,
@@ -399,9 +403,20 @@ enum ProviderCli {
     Echo,
 }
 
+impl ProviderCli {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Amp => "amp",
+            Self::Claude => "claude",
+            Self::Echo => "echo",
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq, Serialize)]
 struct SessionSummary {
     session_id: String,
+    thread_id: String,
     state: SessionState,
     current_node_id: String,
     intent_label: String,
@@ -425,6 +440,7 @@ struct GeneratedNodes {
 #[derive(Debug, Serialize)]
 struct SessionCreateOutput {
     session_id: String,
+    thread_id: String,
     provider: ProviderCli,
     session_path: String,
     current_node: String,
@@ -437,6 +453,7 @@ struct SessionCreateOutput {
 #[derive(Debug, Serialize)]
 struct SessionContinueOutput {
     session_id: String,
+    thread_id: String,
     provider: ProviderCli,
     new_current_node: String,
     prompt_node_id: String,
@@ -448,6 +465,7 @@ struct SessionContinueOutput {
 #[derive(Debug, Serialize)]
 struct SessionShowOutput {
     session_id: String,
+    thread_id: String,
     state: SessionState,
     current_node: String,
     intent: String,
@@ -486,6 +504,7 @@ struct ArtifactMutateOutput {
 #[derive(Debug, Serialize)]
 struct SessionAutoOutput {
     session_id: String,
+    thread_id: String,
     steps_executed: u32,
     final_state: SessionState,
     current_node: String,
@@ -544,6 +563,7 @@ fn run_session_create(args: SessionCreateArgs, runtime: &RuntimeConfig) -> Resul
     let mut session = SessionTree::new(intent_text.clone());
     let session_id = build_session_id();
     session.session_id = SessionId::from(session_id.clone());
+    session.thread_id = create_thread_id_for_provider(args.provider)?;
 
     let sessions_dir = args.sessions_dir.unwrap_or_else(default_sessions_dir);
     let session_dir = sessions_dir.join(&session_id);
@@ -561,11 +581,20 @@ fn run_session_create(args: SessionCreateArgs, runtime: &RuntimeConfig) -> Resul
         SessionEventKind::SessionCreated,
         &session.session_id,
         Some(session.intent_node_id.clone()),
-        json!({"provider":args.provider, "intent":intent_text}),
+        json!({"provider":args.provider, "intent":intent_text, "thread_id":session.thread_id.clone()}),
     )?;
 
     runtime.begin_streaming();
-    let artifact_output = execute_provider_prompt_streaming(args.provider, &intent_text, runtime)?;
+    let artifact_response = execute_provider_prompt_streaming(
+        args.provider,
+        &session.thread_id,
+        &intent_text,
+        runtime,
+    )?;
+    if let Some(thread_id) = artifact_response.thread_id.clone() {
+        session.thread_id = thread_id;
+    }
+    let artifact_output = artifact_response.output;
 
     let intent_node_id = session.intent_node_id.clone();
     let generated = append_generated_prompt_and_artifact(
@@ -581,7 +610,12 @@ fn run_session_create(args: SessionCreateArgs, runtime: &RuntimeConfig) -> Resul
     write_session_json(&session_dir, &session)
         .map_err(|err| AppError::from_io("write session json", err))?;
 
-    let suggestion = suggest_next_prompt(&session);
+    let suggestion = suggest_next_prompt_for_provider(args.provider, &session.thread_id)?;
+    if let Some(thread_id) = suggestion.thread_id.clone() {
+        session.thread_id = thread_id;
+    }
+    write_session_json(&session_dir, &session)
+        .map_err(|err| AppError::from_io("write session json", err))?;
 
     append_event(
         &session_dir,
@@ -595,19 +629,25 @@ fn run_session_create(args: SessionCreateArgs, runtime: &RuntimeConfig) -> Resul
         SessionEventKind::ArtifactProposed,
         &session.session_id,
         Some(generated.artifact_node_id.clone()),
-        json!({"provider":args.provider, "prompt":intent_text}),
+        json!({"provider":args.provider, "prompt":intent_text, "thread_id":session.thread_id.clone()}),
     )?;
     append_event(
         &session_dir,
         SessionEventKind::OrchestrationDecision,
         &session.session_id,
         Some(generated.prompt_node_id.clone()),
-        json!({"stage":"suggest_next_prompt","next_prompt":suggestion.next_prompt}),
+        json!({
+            "stage":"suggest_next_prompt",
+            "next_prompt":suggestion.next_prompt.clone(),
+            "artifacts":suggestion.artifacts.clone(),
+            "thread_id":session.thread_id.clone()
+        }),
     )?;
 
     runtime.text_block(&[
         String::from("session create"),
         format!("Session ID: {}", session.session_id),
+        format!("Thread ID: {}", session.thread_id),
         format!("Provider: {:?}", args.provider),
         format!("Session path: {}", session_dir.display()),
         format!("Current node: {}", session.current_node_id),
@@ -616,6 +656,7 @@ fn run_session_create(args: SessionCreateArgs, runtime: &RuntimeConfig) -> Resul
 
     runtime.emit_json(&SessionCreateOutput {
         session_id,
+        thread_id: session.thread_id.clone(),
         provider: args.provider,
         session_path: session_dir.display().to_string(),
         current_node: session.current_node_id.to_string(),
@@ -641,9 +682,19 @@ fn run_session_continue(
         .map_err(|err| AppError::from_io("acquire session lock", err))?;
     let mut session = read_session_json(&session_dir)
         .map_err(|err| AppError::from_io("load session for continue", err))?;
+    ensure_session_thread_id(args.provider, &mut session)?;
 
     runtime.begin_streaming();
-    let artifact_output = execute_provider_prompt_streaming(args.provider, &args.prompt, runtime)?;
+    let artifact_response = execute_provider_prompt_streaming(
+        args.provider,
+        &session.thread_id,
+        &args.prompt,
+        runtime,
+    )?;
+    if let Some(thread_id) = artifact_response.thread_id.clone() {
+        session.thread_id = thread_id;
+    }
+    let artifact_output = artifact_response.output;
 
     let parent_node_id = session.current_node_id.clone();
     let generated = append_generated_prompt_and_artifact(
@@ -659,7 +710,12 @@ fn run_session_continue(
     write_session_json(&session_dir, &session)
         .map_err(|err| AppError::from_io("write session json", err))?;
 
-    let suggestion = suggest_next_prompt(&session);
+    let suggestion = suggest_next_prompt_for_provider(args.provider, &session.thread_id)?;
+    if let Some(thread_id) = suggestion.thread_id.clone() {
+        session.thread_id = thread_id;
+    }
+    write_session_json(&session_dir, &session)
+        .map_err(|err| AppError::from_io("write session json", err))?;
     append_event(
         &session_dir,
         SessionEventKind::PromptAdded,
@@ -672,19 +728,25 @@ fn run_session_continue(
         SessionEventKind::ArtifactProposed,
         &session.session_id,
         Some(generated.artifact_node_id.clone()),
-        json!({"provider":args.provider, "prompt":args.prompt}),
+        json!({"provider":args.provider, "prompt":args.prompt, "thread_id":session.thread_id.clone()}),
     )?;
     append_event(
         &session_dir,
         SessionEventKind::OrchestrationDecision,
         &session.session_id,
         Some(generated.prompt_node_id.clone()),
-        json!({"stage":"suggest_next_prompt","next_prompt":suggestion.next_prompt}),
+        json!({
+            "stage":"suggest_next_prompt",
+            "next_prompt":suggestion.next_prompt.clone(),
+            "artifacts":suggestion.artifacts.clone(),
+            "thread_id":session.thread_id.clone()
+        }),
     )?;
 
     runtime.text_block(&[
         String::from("session continue"),
         format!("Session ID: {}", session.session_id),
+        format!("Thread ID: {}", session.thread_id),
         format!("Provider: {:?}", args.provider),
         format!("New current node: {}", session.current_node_id),
         format!(
@@ -695,6 +757,7 @@ fn run_session_continue(
 
     runtime.emit_json(&SessionContinueOutput {
         session_id: session.session_id.to_string(),
+        thread_id: session.thread_id.clone(),
         provider: args.provider,
         new_current_node: session.current_node_id.to_string(),
         prompt_node_id: generated.prompt_node_id.to_string(),
@@ -722,6 +785,7 @@ fn run_session_show(args: SessionShowArgs, runtime: &RuntimeConfig) -> Result<()
     runtime.text_block(&[
         String::from("session show"),
         format!("Session ID: {}", session.session_id),
+        format!("Thread ID: {}", session.thread_id),
         format!("State: {:?}", session.state),
         format!("Current node: {}", session.current_node_id),
         format!("Intent: {intent_label}"),
@@ -732,6 +796,7 @@ fn run_session_show(args: SessionShowArgs, runtime: &RuntimeConfig) -> Result<()
 
     runtime.emit_json(&SessionShowOutput {
         session_id: session.session_id.to_string(),
+        thread_id: session.thread_id.clone(),
         state: session.state,
         current_node: session.current_node_id.to_string(),
         intent: intent_label.to_string(),
@@ -756,8 +821,9 @@ fn run_session_list(args: SessionListArgs, runtime: &RuntimeConfig) -> Result<()
         } else {
             for summary in &sessions {
                 println!(
-                    "{} [{:?}] current={} nodes={} intent=\"{}\"",
+                    "{} thread={} [{:?}] current={} nodes={} intent=\"{}\"",
                     summary.session_id,
+                    summary.thread_id,
                     summary.state,
                     summary.current_node_id,
                     summary.node_count,
@@ -1061,6 +1127,7 @@ fn run_session_auto(args: SessionAutoArgs, runtime: &RuntimeConfig) -> Result<()
 
     let mut session = read_session_json(&session_dir)
         .map_err(|err| AppError::from_io("load session for auto mode", err))?;
+    ensure_session_thread_id(args.provider, &mut session)?;
     let resume_state = load_auto_resume_state(&session_dir, &session, args.resume, args.prompt)?;
     session
         .set_current_node(resume_state.current_node_id.clone())
@@ -1079,9 +1146,15 @@ fn run_session_auto(args: SessionAutoArgs, runtime: &RuntimeConfig) -> Result<()
             break;
         }
 
-        let prompt = pending_prompt
-            .take()
-            .unwrap_or_else(|| suggest_next_prompt(&session).next_prompt);
+        let prompt = if let Some(existing_prompt) = pending_prompt.take() {
+            existing_prompt
+        } else {
+            let suggestion = suggest_next_prompt_for_provider(args.provider, &session.thread_id)?;
+            if let Some(thread_id) = suggestion.thread_id {
+                session.thread_id = thread_id;
+            }
+            suggestion.next_prompt
+        };
         write_session_checkpoint(
             &session_dir,
             &SessionCheckpoint::new(
@@ -1095,7 +1168,12 @@ fn run_session_auto(args: SessionAutoArgs, runtime: &RuntimeConfig) -> Result<()
         .map_err(|err| AppError::from_io("write auto checkpoint", err))?;
 
         runtime.begin_streaming();
-        let artifact_output = execute_provider_prompt_streaming(args.provider, &prompt, runtime)?;
+        let artifact_response =
+            execute_provider_prompt_streaming(args.provider, &session.thread_id, &prompt, runtime)?;
+        if let Some(thread_id) = artifact_response.thread_id.clone() {
+            session.thread_id = thread_id;
+        }
+        let artifact_output = artifact_response.output;
 
         let parent_node_id = session.current_node_id.clone();
         let generated = append_generated_prompt_and_artifact(
@@ -1138,7 +1216,7 @@ fn run_session_auto(args: SessionAutoArgs, runtime: &RuntimeConfig) -> Result<()
             SessionEventKind::ArtifactProposed,
             &session.session_id,
             Some(generated.artifact_node_id.clone()),
-            json!({"provider":args.provider,"step":step}),
+            json!({"provider":args.provider,"step":step,"thread_id":session.thread_id.clone()}),
         )?;
         append_event(
             &session_dir,
@@ -1151,6 +1229,7 @@ fn run_session_auto(args: SessionAutoArgs, runtime: &RuntimeConfig) -> Result<()
                 "accepted":review_result.accepted,
                 "confidence":review_result.confidence,
                 "missing_keywords":review_result.missing_keywords,
+                "thread_id":session.thread_id.clone(),
             }),
         )?;
 
@@ -1184,15 +1263,24 @@ fn run_session_auto(args: SessionAutoArgs, runtime: &RuntimeConfig) -> Result<()
             break;
         }
 
-        let suggestion = suggest_next_prompt(&session).next_prompt;
+        let suggestion = suggest_next_prompt_for_provider(args.provider, &session.thread_id)?;
+        if let Some(thread_id) = suggestion.thread_id.clone() {
+            session.thread_id = thread_id;
+        }
         append_event(
             &session_dir,
             SessionEventKind::OrchestrationDecision,
             &session.session_id,
             Some(session.current_node_id.clone()),
-            json!({"stage":"suggest_next_prompt","step":step,"next_prompt":suggestion}),
+            json!({
+                "stage":"suggest_next_prompt",
+                "step":step,
+                "next_prompt":suggestion.next_prompt.clone(),
+                "artifacts":suggestion.artifacts.clone(),
+                "thread_id":session.thread_id.clone()
+            }),
         )?;
-        pending_prompt = Some(suggestion);
+        pending_prompt = Some(suggestion.next_prompt);
         step += 1;
 
         write_session_checkpoint(
@@ -1214,6 +1302,7 @@ fn run_session_auto(args: SessionAutoArgs, runtime: &RuntimeConfig) -> Result<()
 
     runtime.emit_json(&SessionAutoOutput {
         session_id: session.session_id.to_string(),
+        thread_id: session.thread_id.clone(),
         steps_executed: step,
         final_state: session.state,
         current_node: session.current_node_id.to_string(),
@@ -1224,6 +1313,7 @@ fn run_session_auto(args: SessionAutoArgs, runtime: &RuntimeConfig) -> Result<()
     if runtime.output_mode == OutputMode::Text && !runtime.quiet {
         println!("session auto");
         println!("Session ID: {}", session.session_id);
+        println!("Thread ID: {}", session.thread_id);
         println!("Steps executed: {step}");
         println!("State: {:?}", session.state);
         println!("Current node: {}", session.current_node_id);
@@ -1282,6 +1372,7 @@ fn load_session_summaries(sessions_dir: &Path) -> Result<Vec<SessionSummary>, Ap
 
         sessions.push(SessionSummary {
             session_id: session.session_id.to_string(),
+            thread_id: session.thread_id.clone(),
             state: session.state,
             current_node_id: session.current_node_id.to_string(),
             intent_label,
@@ -1435,22 +1526,102 @@ fn supersede_sibling_accepted_artifacts(
 
 fn execute_provider_prompt_streaming(
     provider: ProviderCli,
+    thread_id: &str,
     prompt: &str,
     runtime: &RuntimeConfig,
-) -> Result<String, AppError> {
+) -> Result<ProviderResponse, AppError> {
     let mut on_chunk = |chunk: &str| {
         runtime.stream_chunk(chunk);
     };
 
     let response = match provider {
-        ProviderCli::Amp => generate_artifact_streaming(&AmpProvider, prompt, &mut on_chunk),
-        ProviderCli::Claude => generate_artifact_streaming(&ClaudeProvider, prompt, &mut on_chunk),
-        ProviderCli::Echo => generate_artifact_streaming(&EchoProvider, prompt, &mut on_chunk),
+        ProviderCli::Amp => {
+            generate_artifact_streaming_with_thread(&AmpProvider, prompt, thread_id, &mut on_chunk)
+        }
+        ProviderCli::Claude => generate_artifact_streaming_with_thread(
+            &ClaudeProvider,
+            prompt,
+            thread_id,
+            &mut on_chunk,
+        ),
+        ProviderCli::Echo => {
+            generate_artifact_streaming_with_thread(&EchoProvider, prompt, thread_id, &mut on_chunk)
+        }
     }
     .map_err(AppError::from)?;
 
     runtime.end_streaming(&response.output);
-    Ok(response.output)
+    Ok(response)
+}
+
+fn suggest_next_prompt_for_provider(
+    provider: ProviderCli,
+    thread_id: &str,
+) -> Result<delve_orchestrator::PromptExecutionResult, AppError> {
+    match provider {
+        ProviderCli::Amp => {
+            suggest_next_prompt_with_provider(&AmpProvider, thread_id).map_err(AppError::from)
+        }
+        ProviderCli::Claude => {
+            suggest_next_prompt_with_provider(&ClaudeProvider, thread_id).map_err(AppError::from)
+        }
+        ProviderCli::Echo => {
+            suggest_next_prompt_with_provider(&EchoProvider, thread_id).map_err(AppError::from)
+        }
+    }
+}
+
+fn create_thread_id_for_provider(provider: ProviderCli) -> Result<String, AppError> {
+    let provider_thread_id = match provider {
+        ProviderCli::Amp => AmpProvider.create_thread().map_err(AppError::from)?,
+        ProviderCli::Claude => ClaudeProvider.create_thread().map_err(AppError::from)?,
+        ProviderCli::Echo => EchoProvider.create_thread().map_err(AppError::from)?,
+    };
+
+    match provider {
+        ProviderCli::Amp => provider_thread_id.ok_or_else(|| {
+            AppError::InvalidState(String::from(
+                "amp provider did not return a thread id from create_thread",
+            ))
+        }),
+        ProviderCli::Claude | ProviderCli::Echo => {
+            Ok(provider_thread_id.unwrap_or_else(|| build_local_thread_id(provider)))
+        }
+    }
+}
+
+fn ensure_session_thread_id(
+    provider: ProviderCli,
+    session: &mut SessionTree,
+) -> Result<(), AppError> {
+    if !session_thread_id_requires_refresh(provider, &session.thread_id) {
+        return Ok(());
+    }
+
+    session.thread_id = create_thread_id_for_provider(provider)?;
+    Ok(())
+}
+
+fn session_thread_id_requires_refresh(provider: ProviderCli, thread_id: &str) -> bool {
+    let trimmed = thread_id.trim();
+    if trimmed.is_empty() || trimmed == "thread-unset" {
+        return true;
+    }
+
+    matches!(provider, ProviderCli::Amp) && !looks_like_amp_thread_id(trimmed)
+}
+
+fn looks_like_amp_thread_id(thread_id: &str) -> bool {
+    if !thread_id.starts_with("T-") {
+        return false;
+    }
+
+    let value = &thread_id[2..];
+    if value.len() != 36 {
+        return false;
+    }
+
+    value.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-')
 }
 
 fn append_generated_prompt_and_artifact(
@@ -1549,6 +1720,13 @@ fn build_node_id(prefix: &str) -> String {
         .map_or(0, |duration| duration.as_nanos());
 
     format!("{prefix}-{epoch_nanos}")
+}
+
+fn build_local_thread_id(provider: ProviderCli) -> String {
+    let epoch_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("thread-{}-{epoch_nanos}", provider.as_str())
 }
 
 fn build_label(prefix: &str, value: &str) -> String {
@@ -1831,8 +2009,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        load_auto_resume_state, load_session_summaries, ArtifactCommand, Cli, Command,
-        InterruptController, SessionCheckpoint, SessionCommand, SessionState,
+        load_auto_resume_state, load_session_summaries, looks_like_amp_thread_id,
+        session_thread_id_requires_refresh, ArtifactCommand, Cli, Command, InterruptController,
+        ProviderCli, SessionCheckpoint, SessionCommand, SessionState,
     };
 
     #[test]
@@ -1939,6 +2118,32 @@ mod tests {
         assert!(!controller.simulate_interrupt());
         assert!(controller.should_gracefully_stop());
         assert!(controller.simulate_interrupt());
+    }
+
+    #[test]
+    fn amp_thread_id_shape_validation_matches_expected_format() {
+        assert!(looks_like_amp_thread_id(
+            "T-12345678-1234-1234-1234-1234567890ab"
+        ));
+        assert!(!looks_like_amp_thread_id("thread-amp-legacy"));
+        assert!(!looks_like_amp_thread_id("T-not-a-uuid"));
+    }
+
+    #[test]
+    fn amp_provider_refreshes_missing_or_legacy_thread_ids() {
+        assert!(session_thread_id_requires_refresh(ProviderCli::Amp, ""));
+        assert!(session_thread_id_requires_refresh(
+            ProviderCli::Amp,
+            "thread-amp-legacy"
+        ));
+        assert!(!session_thread_id_requires_refresh(
+            ProviderCli::Amp,
+            "T-12345678-1234-1234-1234-1234567890ab"
+        ));
+        assert!(!session_thread_id_requires_refresh(
+            ProviderCli::Echo,
+            "thread-echo-123"
+        ));
     }
 
     fn unique_test_dir(label: &str) -> std::path::PathBuf {
