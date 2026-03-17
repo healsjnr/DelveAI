@@ -1471,7 +1471,7 @@ impl InteractiveTuiApp {
 
         let viewer_title = self.selected_tree_node().map_or_else(
             || String::from("Viewer"),
-            |node| format!("Viewer: {} [{:?}]", node.id, node.kind),
+            |node| format!("Viewer: {} [{:?}]", node.label, node.kind),
         );
         let viewer_scroll = resolve_content_scroll_offset(
             &self.viewer_pane_text,
@@ -1838,7 +1838,7 @@ impl InteractiveTuiApp {
         };
 
         self.preview = Some(InteractiveArtifactPreview {
-            title: node.id.to_string(),
+            title: node.label.clone(),
             body: self.viewer_pane_text.clone(),
         });
     }
@@ -3073,10 +3073,10 @@ fn render_tree_entries(session: &SessionTree) -> Vec<(NodeId, String)> {
                 format!(
                     "{}{} [{:?}/{:?}] {}",
                     "  ".repeat(depth),
-                    node.id,
+                    node.label,
                     node.kind,
                     node.status,
-                    node.label
+                    node.id
                 ),
             ));
             for child in &node.children_ids {

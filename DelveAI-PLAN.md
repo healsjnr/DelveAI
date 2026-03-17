@@ -275,23 +275,23 @@ Phase exit criteria:
 2. Original artifact is preserved and can be independently accepted or rejected.
 3. Regeneration uses the same provider and thread context as the original execution.
 
-## Phase 10 - LLM-Powered Label Naming
+## Phase 10 - LLM-Powered Label Generation
 
-Objective: Replace truncated-text label slugs with short LLM-generated summaries for readable naming.
+Objective: Replace truncated-text label slugs with short LLM-generated summaries for readable labels in the tree view.
 
 Tasks:
-- [ ] Add `generate_short_name(text: &str) -> Result<String, ProviderError>` utility to `delve-providers` with a system prompt instructing: "Return a 3-5 word summary suitable as a filesystem-safe label. No punctuation, no explanation."
-- [ ] Change `generate_intent_label`, `generate_prompt_label`, `generate_artifact_label` signatures in `delve-storage` to accept an optional `short_name: Option<&str>` parameter.
-- [ ] Add `generate_label_with_summary(kind, source, short_name)` to `delve-storage` that uses the short name for the slug but preserves the original source for hash stability.
-- [ ] Update all label generation call sites in `delve-cli` (`session create`, `session continue`, `append_generated_prompt_and_artifact`) to call `generate_short_name()` before generating the label.
-- [ ] Wrap naming LLM calls with fallback: if the call fails, log a warning and fall back to existing truncation behavior.
-- [ ] Update unit tests for label generation to cover the short-name path.
-- [ ] Add integration test verifying labels use LLM-generated names with mock provider.
+- [ ] Add `generate_short_label(text: &str) -> Result<String, ProviderError>` utility to `delve-providers` with a system prompt instructing: "Return a 3-5 word summary suitable as a filesystem-safe label. No punctuation, no explanation."
+- [ ] Change `generate_intent_label`, `generate_prompt_label`, `generate_artifact_label` signatures in `delve-storage` to accept an optional `short_label: Option<&str>` parameter.
+- [ ] Add `generate_label_with_summary(kind, source, short_label)` to `delve-storage` that uses the short label for the slug but preserves the original source for hash stability.
+- [ ] Update all label generation call sites in `delve-cli` (`session create`, `session continue`, `append_generated_prompt_and_artifact`) to call `generate_short_label()` before generating the label.
+- [ ] Wrap labelling LLM calls with fallback: if the call fails, log a warning and fall back to existing truncation behavior.
+- [ ] Update unit tests for label generation to cover the short-label path.
+- [ ] Add integration test verifying the tree view displays LLM-generated labels with mock provider.
 
 Phase exit criteria:
-1. Labels use LLM-generated short names when a provider is available.
-2. Label generation gracefully falls back to truncation when the naming call fails.
-3. LLM naming calls are not recorded as prompt/artifact nodes in the session tree.
+1. The tree view uses LLM-generated labels for artefacts, prompts, and intents when a provider is available.
+2. Label generation gracefully falls back to truncation when the labelling call fails.
+3. LLM labelling calls are not recorded as prompt/artifact nodes in the session tree.
 
 ## Phase 11 - Git-Backed Implementation Artifacts
 
@@ -446,7 +446,7 @@ Phase exit criteria:
 
 1. Milestone A: CLI can create and continue sessions with persisted trees.
 2. Milestone B: Auto-interactive loop runs with review gating and resume support.
-3. Milestone B2: Next-prompt suggestion removed, artifact editing and regeneration available, labels use LLM-generated names.
+3. Milestone B2: Next-prompt suggestion removed, artifact editing and regeneration available, tree view uses LLM-generated labels.
 4. Milestone C: Git-backed implementation artifacts are stable.
 5. Milestone C2: Sub-agent results captured as individual artifacts.
 6. Milestone D: Web frontend supports end-to-end local workflows.
