@@ -123,20 +123,6 @@ fn provider_backed_continue_streams_and_persists_artifact_payload() {
     let continue_stdout = stdout_string(&continue_output);
     assert!(continue_stdout.contains("echo:Continue with implementation details"));
 
-    let suggestion_event = latest_suggest_next_prompt_event(&sessions_dir, &session_id);
-    let suggestion_artifacts = suggestion_event["metadata"]["artifacts"]
-        .as_array()
-        .expect("suggestion artifacts should be present in event metadata");
-    assert_eq!(suggestion_artifacts.len(), 1);
-    assert_eq!(
-        suggestion_artifacts[0]["artifact_kind"].as_str(),
-        Some("Context")
-    );
-    assert_eq!(
-        suggestion_artifacts[0]["body"].as_str(),
-        Some("echo:Based on the context available, what it is the suggested to next step to complete this Intent?")
-    );
-
     let continued_thread_id = read_session_thread_id(&sessions_dir, &session_id);
     assert_eq!(continued_thread_id, initial_thread_id);
 
@@ -218,8 +204,8 @@ fn json_mode_and_exit_codes_are_script_friendly() {
 }
 
 #[test]
-fn amp_continue_refreshes_legacy_thread_and_uses_amp_for_suggestion() {
-    let test_root = unique_test_dir("amp-suggestion");
+fn amp_continue_refreshes_legacy_thread() {
+    let test_root = unique_test_dir("amp-thread-refresh");
     let sessions_dir = test_root.join("sessions");
     let fake_bin_dir = test_root.join("fake-bin");
     fs::create_dir_all(&fake_bin_dir).expect("fake bin dir should be created");
@@ -289,10 +275,6 @@ fn amp_continue_refreshes_legacy_thread_and_uses_amp_for_suggestion() {
     let continue_json: Value = serde_json::from_str(&stdout_string(&continue_output))
         .expect("continue output should be valid json");
     assert_eq!(
-        continue_json["suggested_next_prompt"].as_str(),
-        Some("AMP-SUGGESTION")
-    );
-    assert_eq!(
         continue_json["thread_id"].as_str(),
         Some("T-12345678-1234-1234-1234-1234567890ab")
     );
@@ -304,9 +286,6 @@ fn amp_continue_refreshes_legacy_thread_and_uses_amp_for_suggestion() {
     assert!(amp_log.contains("threads new"));
     assert!(amp_log.contains(
         "threads continue T-12345678-1234-1234-1234-1234567890ab -x Continue with amp --stream-json"
-    ));
-    assert!(amp_log.contains(
-        "threads continue T-12345678-1234-1234-1234-1234567890ab -x Based on the context available, what it is the suggested to next step to complete this Intent? --stream-json"
     ));
 }
 
@@ -397,22 +376,6 @@ fn unique_test_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     env::temp_dir().join(format!("delve-cli-integration-{label}-{epoch_nanos}"))
-}
-
-fn latest_suggest_next_prompt_event(sessions_dir: &Path, session_id: &str) -> Value {
-    let session_dir = sessions_dir.join(session_id);
-    let events_path = session_dir.join("events.jsonl");
-    let events_content = fs::read_to_string(events_path).expect("events file should exist");
-
-    events_content
-        .lines()
-        .rev()
-        .map(|line| serde_json::from_str::<Value>(line).expect("event line should parse"))
-        .find(|event| {
-            event["event_kind"] == "orchestration_decision"
-                && event["metadata"]["stage"] == "suggest_next_prompt"
-        })
-        .expect("suggest-next-prompt event should exist")
 }
 
 #[cfg(unix)]

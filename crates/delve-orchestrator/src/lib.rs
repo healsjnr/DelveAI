@@ -11,13 +11,6 @@ use delve_providers::{CompletionProvider, ProviderError, ProviderRequest, Provid
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptExecutionResult {
-    pub next_prompt: String,
-    pub thread_id: Option<String>,
-    pub artifacts: Vec<ArtifactProposal>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextEntry {
     pub node_id: NodeId,
     pub text: String,
@@ -98,31 +91,6 @@ impl From<ValidationError> for OrchestrationError {
     fn from(value: ValidationError) -> Self {
         Self::DomainValidation(value)
     }
-}
-
-pub fn suggest_next_prompt_with_provider<P>(
-    provider: &P,
-    thread_id: &str,
-) -> Result<PromptExecutionResult, ProviderError>
-where
-    P: CompletionProvider + ?Sized,
-{
-    let request = ProviderRequest {
-        prompt: String::from(
-            "Based on the context available, what it is the suggested to next step to complete this Intent?",
-        ),
-        thread_id: Some(thread_id.to_string()),
-    };
-    let response = provider.generate(&request)?;
-
-    Ok(PromptExecutionResult {
-        next_prompt: response.output.clone(),
-        thread_id: response.thread_id,
-        artifacts: vec![ArtifactProposal {
-            artifact_kind: ArtifactKind::Context,
-            body: response.output,
-        }],
-    })
 }
 
 pub fn resolve_context_node_ids(
@@ -359,8 +327,8 @@ mod tests {
 
     use super::{
         build_prompt_package, execute_review, generate_artifact, generate_artifact_streaming,
-        parse_review_rubric, resolve_context_node_ids, suggest_next_prompt_with_provider,
-        ArtifactKind, OrchestrationError, ReviewRubric,
+        parse_review_rubric, resolve_context_node_ids, ArtifactKind, OrchestrationError,
+        ReviewRubric,
     };
 
     #[test]
@@ -469,47 +437,6 @@ mod tests {
             result,
             Err(OrchestrationError::InvalidReviewRubric(_))
         ));
-    }
-
-    #[test]
-    fn suggest_next_prompt_uses_provider_and_thread_id() {
-        struct SuggestionProvider;
-
-        impl CompletionProvider for SuggestionProvider {
-            fn generate(
-                &self,
-                request: &delve_providers::ProviderRequest,
-            ) -> Result<delve_providers::ProviderResponse, ProviderError> {
-                assert_eq!(
-                    request.prompt,
-                    "Based on the context available, what it is the suggested to next step to complete this Intent?"
-                );
-                assert_eq!(
-                    request.thread_id.as_deref(),
-                    Some("T-12345678-1234-1234-1234-1234567890ab")
-                );
-
-                Ok(delve_providers::ProviderResponse {
-                    output: String::from("Next: focus on verification"),
-                    thread_id: request.thread_id.clone(),
-                })
-            }
-        }
-
-        let suggestion = suggest_next_prompt_with_provider(
-            &SuggestionProvider,
-            "T-12345678-1234-1234-1234-1234567890ab",
-        )
-        .expect("suggestion should succeed");
-
-        assert_eq!(suggestion.next_prompt, "Next: focus on verification");
-        assert_eq!(
-            suggestion.thread_id.as_deref(),
-            Some("T-12345678-1234-1234-1234-1234567890ab")
-        );
-        assert_eq!(suggestion.artifacts.len(), 1);
-        assert_eq!(suggestion.artifacts[0].artifact_kind, ArtifactKind::Context);
-        assert_eq!(suggestion.artifacts[0].body, "Next: focus on verification");
     }
 
     fn session_fixture() -> SessionTree {

@@ -223,15 +223,15 @@ Phase exit criteria:
 Objective: Remove the next-prompt suggestion feature from orchestration, CLI, and auto-interactive loop.
 
 Tasks:
-- [ ] Delete `suggest_next_prompt_with_provider()` function from `delve-orchestrator`.
-- [ ] Remove `next_prompt` field from `PromptExecutionResult` in `delve-orchestrator`.
-- [ ] Remove `suggest_next_prompt_for_provider()` wrapper and all call sites in `delve-cli` (`run_session_create`, `run_session_continue`, interactive loop, auto-interactive loop).
-- [ ] Remove `suggested_next_prompt` field from `SessionCreateOutput` and `SessionContinueOutput`.
-- [ ] Remove `OrchestrationDecision` event appends for `stage: "suggest_next_prompt"` across all CLI flows.
-- [ ] Remove or update the `suggest_next_prompt_uses_provider_and_thread_id` unit test in `delve-orchestrator`.
-- [ ] Remove "Suggested next prompt:" text output line and update auto-loop to rely solely on user-composed or review-driven prompts.
-- [ ] Remove the next-prompt suggestion task references from Phase 4 and Phase 6 task lists.
-- [ ] Compile, run `make check`, fix any dead-code warnings.
+- [x] Delete `suggest_next_prompt_with_provider()` function from `delve-orchestrator`.
+- [x] Remove `next_prompt` field from `PromptExecutionResult` in `delve-orchestrator`.
+- [x] Remove `suggest_next_prompt_for_provider()` wrapper and all call sites in `delve-cli` (`run_session_create`, `run_session_continue`, interactive loop, auto-interactive loop).
+- [x] Remove `suggested_next_prompt` field from `SessionCreateOutput` and `SessionContinueOutput`.
+- [x] Remove `OrchestrationDecision` event appends for `stage: "suggest_next_prompt"` across all CLI flows.
+- [x] Remove or update the `suggest_next_prompt_uses_provider_and_thread_id` unit test in `delve-orchestrator`.
+- [x] Remove "Suggested next prompt:" text output line and update auto-loop to rely solely on user-composed or review-driven prompts.
+- [x] Remove the next-prompt suggestion task references from Phase 4 and Phase 6 task lists.
+- [x] Compile, run `make check`, fix any dead-code warnings.
 
 Phase exit criteria:
 1. No next-prompt suggestion logic remains in any crate.
