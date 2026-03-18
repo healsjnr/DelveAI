@@ -275,7 +275,30 @@ Phase exit criteria:
 2. Original artifact is preserved and can be independently accepted or rejected.
 3. Regeneration uses the same provider and thread context as the original execution.
 
-## Phase 10 - LLM-Powered Label Generation
+## Phase 10 - Prompt Execution Error Recovery
+
+Objective: Ensure provider errors during prompt execution are handled gracefully, preserving all work done up to the point of failure, and allowing re-execution of the failed prompt.
+
+Tasks:
+- [ ] Add `NodeStatus::Failed` variant to `delve-domain`.
+- [ ] Update transition validator to allow `Failed -> Proposed` (for re-execution) and prevent other transitions from `Failed`.
+- [ ] Add `SessionEventKind::PromptFailed` variant to `delve-storage`.
+- [ ] Update all prompt execution paths (`session create`, `session continue`, interactive, auto-interactive) so that when a provider error occurs mid-execution: the prompt node is persisted, any partial artifact output received before the error is saved as a `Proposed` artifact node, the prompt node is marked `Failed`, a `PromptFailed` event is logged with the error details, and the session is saved to disk.
+- [ ] Ensure the session remains in a valid, loadable state after a prompt failure (no dangling references, tree invariants hold).
+- [ ] Add `PromptRetry` command variant and `PromptRetryArgs` struct to `delve-cli` with `--session` and `--prompt-node` flags.
+- [ ] Implement `run_prompt_retry()` in `delve-cli`: load session, verify the prompt node has `Failed` status, read prompt text from `payload_ref`, re-execute via the provider, append a new artifact node under the same prompt, transition prompt status back to `Proposed`, save session, log events.
+- [ ] Add "Retry" option to the interactive mode action menu, gated on `Failed` prompt status.
+- [ ] Update tree visualization to visually distinguish `Failed` prompt nodes (e.g., with a marker or status indicator).
+- [ ] Add unit tests for `Failed` status transitions and invariants.
+- [ ] Add integration test: trigger a provider error mid-execution, verify prompt is marked `Failed`, partial artifact is saved, session is loadable, and retry produces a new artifact.
+
+Phase exit criteria:
+1. Provider errors never leave the session in a corrupt or unloadable state.
+2. Prompt text and any partial artifacts are preserved on failure.
+3. Failed prompts can be retried, producing new artifacts under the same prompt node.
+4. All failures are recorded as `PromptFailed` events with error details.
+
+## Phase 11 - LLM-Powered Label Generation
 
 Objective: Replace truncated-text label slugs with short LLM-generated summaries for readable labels in the tree view.
 
@@ -293,7 +316,7 @@ Phase exit criteria:
 2. Label generation gracefully falls back to truncation when the labelling call fails.
 3. LLM labelling calls are not recorded as prompt/artifact nodes in the session tree.
 
-## Phase 11 - Git-Backed Implementation Artifacts
+## Phase 12 - Git-Backed Implementation Artifacts
 
 Objective: Support code-change artifacts with safe branch/ref lifecycle.
 
@@ -318,7 +341,7 @@ Phase exit criteria:
 1. Implementation artifacts can reliably reference git branches/commits.
 2. Unsafe repo states fail fast with actionable guidance.
 
-## Phase 12 - Local API Server For Frontend
+## Phase 13 - Local API Server For Frontend
 
 Objective: Expose stable local APIs so web frontend reuses CLI/domain logic.
 
@@ -344,7 +367,7 @@ Phase exit criteria:
 1. Frontend can consume all required workflow APIs.
 2. API contracts are stable and documented.
 
-## Phase 13 - Local Web Frontend V1
+## Phase 14 - Local Web Frontend V1
 
 Objective: Provide intuitive artifact-centric UX on top of local API.
 
@@ -371,7 +394,7 @@ Phase exit criteria:
 1. Users can complete core session workflows without CLI.
 2. Frontend behavior matches CLI/domain rules.
 
-## Phase 14 - Sub-Agent Artifact Capture
+## Phase 15 - Sub-Agent Artifact Capture
 
 Objective: Capture sub-agent results from provider responses as sibling artifacts alongside the main prompt result.
 
@@ -393,7 +416,7 @@ Phase exit criteria:
 2. Existing single-result behavior is unchanged when no sub-agent entries are present.
 3. Sub-agent artifacts are visible and manageable (accept/reject/edit/regenerate) like any other artifact.
 
-## Phase 15 - Quality, Hardening, And Release
+## Phase 16 - Quality, Hardening, And Release
 
 Objective: Validate reliability, polish docs, and ship V1 release candidate.
 
@@ -426,8 +449,8 @@ Phase exit criteria:
 4. In Phase 5 and 6, interactive and non-interactive CLI work can be split once shared command core exists.
 5. Phase 7 is independent and can start immediately after Phase 6.
 6. Phases 8, 9, and 10 can run in parallel after Phase 7 completes (no cross-dependencies).
-7. Phase 14 can run in parallel with Phases 11, 12, and 13 (independent provider/orchestration work).
-8. In Phase 12 and 13, API and frontend can run in parallel after endpoint contracts are frozen.
+7. Phase 15 can run in parallel with Phases 12, 13, and 14 (independent provider/orchestration work).
+8. In Phase 13 and 14, API and frontend can run in parallel after endpoint contracts are frozen.
 
 ## Dependencies Summary
 
@@ -437,16 +460,17 @@ Phase exit criteria:
 4. Phase 4 should complete before auto-interactive UX stabilizes.
 5. Phase 7 depends on Phase 4, 5, and 6 (removes code introduced in those phases).
 6. Phase 8 and 9 depend on Phase 7 (suggestion removal simplifies the flows they modify).
-7. Phase 10 depends on Phase 4 (extends provider trait) and Phase 3 (modifies label generation).
-8. Phase 14 depends on Phase 4 (extends provider response schema) and Phase 9 (sibling artifact pattern).
-9. Phase 12 should complete before frontend feature completion.
-10. Phase 15 begins once all functional phases reach baseline completeness.
+7. Phase 10 depends on Phase 7 (modifies prompt execution error paths cleaned up in Phase 7) and Phase 9 (re-execution builds on the regeneration sibling pattern).
+8. Phase 11 depends on Phase 4 (extends provider trait) and Phase 3 (modifies label generation).
+9. Phase 15 depends on Phase 4 (extends provider response schema) and Phase 9 (sibling artifact pattern).
+10. Phase 13 should complete before frontend feature completion.
+11. Phase 16 begins once all functional phases reach baseline completeness.
 
 ## Milestone Definitions
 
 1. Milestone A: CLI can create and continue sessions with persisted trees.
 2. Milestone B: Auto-interactive loop runs with review gating and resume support.
-3. Milestone B2: Next-prompt suggestion removed, artifact editing and regeneration available, tree view uses LLM-generated labels.
+3. Milestone B2: Next-prompt suggestion removed, artifact editing and regeneration available, prompt error recovery with retry, tree view uses LLM-generated labels.
 4. Milestone C: Git-backed implementation artifacts are stable.
 5. Milestone C2: Sub-agent results captured as individual artifacts.
 6. Milestone D: Web frontend supports end-to-end local workflows.

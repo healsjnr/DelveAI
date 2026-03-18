@@ -24,9 +24,7 @@ use crossterm::terminal::{
 use delve_domain::{
     ArtifactKind, NodeId, NodeKind, NodeStatus, SessionId, SessionNode, SessionState, SessionTree,
 };
-use delve_orchestrator::{
-    execute_review, generate_artifact_streaming_with_thread, suggest_next_prompt_with_provider,
-};
+use delve_orchestrator::{execute_review, generate_artifact_streaming_with_thread};
 use delve_providers::{
     AmpProvider, ClaudeProvider, CompletionProvider, EchoProvider, ProviderError, ProviderResponse,
 };
@@ -465,7 +463,6 @@ struct SessionCreateOutput {
     prompt_node_id: String,
     artifact_node_id: String,
     artifact_path: String,
-    suggested_next_prompt: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -477,7 +474,6 @@ struct SessionContinueOutput {
     prompt_node_id: String,
     artifact_node_id: String,
     artifact_path: String,
-    suggested_next_prompt: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -672,13 +668,6 @@ fn run_session_create(args: SessionCreateArgs, runtime: &RuntimeConfig) -> Resul
     write_session_json(&session_dir, &session)
         .map_err(|err| AppError::from_io("write session json", err))?;
 
-    let suggestion = suggest_next_prompt_for_provider(args.provider, &session.thread_id)?;
-    if let Some(thread_id) = suggestion.thread_id.clone() {
-        session.thread_id = thread_id;
-    }
-    write_session_json(&session_dir, &session)
-        .map_err(|err| AppError::from_io("write session json", err))?;
-
     append_event(
         &session_dir,
         SessionEventKind::PromptAdded,
@@ -693,18 +682,6 @@ fn run_session_create(args: SessionCreateArgs, runtime: &RuntimeConfig) -> Resul
         Some(generated.artifact_node_id.clone()),
         json!({"provider":args.provider, "prompt":intent_text, "thread_id":session.thread_id.clone()}),
     )?;
-    append_event(
-        &session_dir,
-        SessionEventKind::OrchestrationDecision,
-        &session.session_id,
-        Some(generated.prompt_node_id.clone()),
-        json!({
-            "stage":"suggest_next_prompt",
-            "next_prompt":suggestion.next_prompt.clone(),
-            "artifacts":suggestion.artifacts.clone(),
-            "thread_id":session.thread_id.clone()
-        }),
-    )?;
 
     runtime.text_block(&[
         String::from("session create"),
@@ -713,7 +690,6 @@ fn run_session_create(args: SessionCreateArgs, runtime: &RuntimeConfig) -> Resul
         format!("Provider: {:?}", args.provider),
         format!("Session path: {}", session_dir.display()),
         format!("Current node: {}", session.current_node_id),
-        format!("Suggested next prompt: {}", suggestion.next_prompt),
     ]);
 
     runtime.emit_json(&SessionCreateOutput {
@@ -728,7 +704,6 @@ fn run_session_create(args: SessionCreateArgs, runtime: &RuntimeConfig) -> Resul
             .join(&generated.artifact_file_rel)
             .display()
             .to_string(),
-        suggested_next_prompt: suggestion.next_prompt,
     })?;
 
     Ok(())
@@ -772,12 +747,6 @@ fn run_session_continue(
     write_session_json(&session_dir, &session)
         .map_err(|err| AppError::from_io("write session json", err))?;
 
-    let suggestion = suggest_next_prompt_for_provider(args.provider, &session.thread_id)?;
-    if let Some(thread_id) = suggestion.thread_id.clone() {
-        session.thread_id = thread_id;
-    }
-    write_session_json(&session_dir, &session)
-        .map_err(|err| AppError::from_io("write session json", err))?;
     append_event(
         &session_dir,
         SessionEventKind::PromptAdded,
@@ -791,18 +760,6 @@ fn run_session_continue(
         &session.session_id,
         Some(generated.artifact_node_id.clone()),
         json!({"provider":args.provider, "prompt":args.prompt, "thread_id":session.thread_id.clone()}),
-    )?;
-    append_event(
-        &session_dir,
-        SessionEventKind::OrchestrationDecision,
-        &session.session_id,
-        Some(generated.prompt_node_id.clone()),
-        json!({
-            "stage":"suggest_next_prompt",
-            "next_prompt":suggestion.next_prompt.clone(),
-            "artifacts":suggestion.artifacts.clone(),
-            "thread_id":session.thread_id.clone()
-        }),
     )?;
 
     runtime.text_block(&[
@@ -828,7 +785,6 @@ fn run_session_continue(
             .join(&generated.artifact_file_rel)
             .display()
             .to_string(),
-        suggested_next_prompt: suggestion.next_prompt,
     })?;
 
     Ok(())
@@ -1751,12 +1707,10 @@ impl InteractiveTuiApp {
                 &sessions_dir,
                 &mut on_chunk,
             ) {
-                Ok(suggested_next_prompt) => {
+                Ok(()) => {
                     let _ = worker_tx.send(InteractiveWorkerEvent::SessionTaskFinished {
                         session_id,
-                        status_message: format!(
-                            "Prompt finished. Suggested next prompt: {suggested_next_prompt}"
-                        ),
+                        status_message: String::from("Prompt finished."),
                     });
                 }
                 Err(err) => {
@@ -1811,12 +1765,10 @@ impl InteractiveTuiApp {
                 &sessions_dir,
                 &mut on_chunk,
             ) {
-                Ok(suggested_next_prompt) => {
+                Ok(()) => {
                     let _ = worker_tx.send(InteractiveWorkerEvent::SessionTaskFinished {
                         session_id,
-                        status_message: format!(
-                            "Intent created. Suggested next prompt: {suggested_next_prompt}"
-                        ),
+                        status_message: String::from("Intent created."),
                     });
                 }
                 Err(err) => {
@@ -2177,7 +2129,7 @@ fn run_session_create_in_background(
     provider: ProviderCli,
     sessions_dir: &Path,
     on_chunk: &mut dyn FnMut(&str),
-) -> Result<String, AppError> {
+) -> Result<(), AppError> {
     let mut session = SessionTree::new(intent_text.to_string());
     session.session_id = SessionId::from(session_id.to_string());
     session.thread_id = create_thread_id_for_provider(provider)?;
@@ -2240,50 +2192,7 @@ fn run_session_create_in_background(
         json!({"provider":provider, "prompt":intent_text, "thread_id":session.thread_id.clone()}),
     )?;
 
-    let suggested_next_prompt = match suggest_next_prompt_for_provider(provider, &session.thread_id)
-    {
-        Ok(suggestion) => {
-            if let Some(thread_id) = suggestion.thread_id.clone() {
-                session.thread_id = thread_id;
-            }
-            write_session_json(&session_dir, &session)
-                .map_err(|err| AppError::from_io("write session json", err))?;
-            append_event(
-                &session_dir,
-                SessionEventKind::OrchestrationDecision,
-                &session.session_id,
-                Some(generated.prompt_node_id),
-                json!({
-                    "stage":"suggest_next_prompt",
-                    "next_prompt":suggestion.next_prompt.clone(),
-                    "artifacts":suggestion.artifacts.clone(),
-                    "thread_id":session.thread_id.clone()
-                }),
-            )?;
-            suggestion.next_prompt
-        }
-        Err(err) => {
-            append_error_log(
-                sessions_dir,
-                &format!("suggest_next_prompt_failed session={session_id}"),
-                &err.to_string(),
-            );
-            append_event(
-                &session_dir,
-                SessionEventKind::OrchestrationDecision,
-                &session.session_id,
-                Some(generated.prompt_node_id),
-                json!({
-                    "stage":"suggest_next_prompt_failed",
-                    "error": err.to_string(),
-                    "thread_id":session.thread_id.clone()
-                }),
-            )?;
-            String::from("<suggestion unavailable>")
-        }
-    };
-
-    Ok(suggested_next_prompt)
+    Ok(())
 }
 
 fn run_session_continue_in_background(
@@ -2292,7 +2201,7 @@ fn run_session_continue_in_background(
     provider: ProviderCli,
     sessions_dir: &Path,
     on_chunk: &mut dyn FnMut(&str),
-) -> Result<String, AppError> {
+) -> Result<(), AppError> {
     let session_dir = sessions_dir.join(session_id);
     let _lock = acquire_session_lock(&session_dir)
         .map_err(|err| AppError::from_io("acquire session lock", err))?;
@@ -2340,50 +2249,7 @@ fn run_session_continue_in_background(
         json!({"provider":provider, "prompt":prompt, "thread_id":session.thread_id.clone()}),
     )?;
 
-    let suggested_next_prompt = match suggest_next_prompt_for_provider(provider, &session.thread_id)
-    {
-        Ok(suggestion) => {
-            if let Some(thread_id) = suggestion.thread_id.clone() {
-                session.thread_id = thread_id;
-            }
-            write_session_json(&session_dir, &session)
-                .map_err(|err| AppError::from_io("write session json", err))?;
-            append_event(
-                &session_dir,
-                SessionEventKind::OrchestrationDecision,
-                &session.session_id,
-                Some(generated.prompt_node_id),
-                json!({
-                    "stage":"suggest_next_prompt",
-                    "next_prompt":suggestion.next_prompt.clone(),
-                    "artifacts":suggestion.artifacts.clone(),
-                    "thread_id":session.thread_id.clone()
-                }),
-            )?;
-            suggestion.next_prompt
-        }
-        Err(err) => {
-            append_error_log(
-                sessions_dir,
-                &format!("suggest_next_prompt_failed session={session_id}"),
-                &err.to_string(),
-            );
-            append_event(
-                &session_dir,
-                SessionEventKind::OrchestrationDecision,
-                &session.session_id,
-                Some(generated.prompt_node_id),
-                json!({
-                    "stage":"suggest_next_prompt_failed",
-                    "error": err.to_string(),
-                    "thread_id":session.thread_id.clone()
-                }),
-            )?;
-            String::from("<suggestion unavailable>")
-        }
-    };
-
-    Ok(suggested_next_prompt)
+    Ok(())
 }
 
 fn execute_provider_prompt_streaming_with_callback(
@@ -2436,11 +2302,7 @@ fn run_session_auto(args: SessionAutoArgs, runtime: &RuntimeConfig) -> Result<()
         let prompt = if let Some(existing_prompt) = pending_prompt.take() {
             existing_prompt
         } else {
-            let suggestion = suggest_next_prompt_for_provider(args.provider, &session.thread_id)?;
-            if let Some(thread_id) = suggestion.thread_id {
-                session.thread_id = thread_id;
-            }
-            suggestion.next_prompt
+            String::from("Continue")
         };
         write_session_checkpoint(
             &session_dir,
@@ -2550,24 +2412,6 @@ fn run_session_auto(args: SessionAutoArgs, runtime: &RuntimeConfig) -> Result<()
             break;
         }
 
-        let suggestion = suggest_next_prompt_for_provider(args.provider, &session.thread_id)?;
-        if let Some(thread_id) = suggestion.thread_id.clone() {
-            session.thread_id = thread_id;
-        }
-        append_event(
-            &session_dir,
-            SessionEventKind::OrchestrationDecision,
-            &session.session_id,
-            Some(session.current_node_id.clone()),
-            json!({
-                "stage":"suggest_next_prompt",
-                "step":step,
-                "next_prompt":suggestion.next_prompt.clone(),
-                "artifacts":suggestion.artifacts.clone(),
-                "thread_id":session.thread_id.clone()
-            }),
-        )?;
-        pending_prompt = Some(suggestion.next_prompt);
         step += 1;
 
         write_session_checkpoint(
@@ -2839,23 +2683,6 @@ fn execute_provider_prompt_streaming(
 
     runtime.end_streaming(&response.output);
     Ok(response)
-}
-
-fn suggest_next_prompt_for_provider(
-    provider: ProviderCli,
-    thread_id: &str,
-) -> Result<delve_orchestrator::PromptExecutionResult, AppError> {
-    match provider {
-        ProviderCli::Amp => {
-            suggest_next_prompt_with_provider(&AmpProvider, thread_id).map_err(AppError::from)
-        }
-        ProviderCli::Claude => {
-            suggest_next_prompt_with_provider(&ClaudeProvider, thread_id).map_err(AppError::from)
-        }
-        ProviderCli::Echo => {
-            suggest_next_prompt_with_provider(&EchoProvider, thread_id).map_err(AppError::from)
-        }
-    }
 }
 
 fn create_thread_id_for_provider(provider: ProviderCli) -> Result<String, AppError> {
