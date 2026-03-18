@@ -185,7 +185,11 @@ impl CompletionProvider for AmpProvider {
     }
 
     fn create_thread(&self) -> Result<Option<String>, ProviderError> {
-        let args = vec![String::from("threads"), String::from("new")];
+        let args = vec![
+            String::from("--dangerously-allow-all"),
+            String::from("threads"),
+            String::from("new"),
+        ];
         let response = run_command_provider(ProviderKind::Amp, "amp", &args)?;
         let thread_id = extract_thread_id(&response.output).ok_or_else(|| {
             ProviderError::ThreadIdParseFailed {
@@ -236,9 +240,13 @@ impl CompletionProvider for ClaudeProvider {
     }
 }
 
+// Delve passes --dangerously-allow-all because it is an autonomous orchestrator
+// running amp in non-interactive --execute --stream-json mode, which cannot
+// handle interactive tool approval prompts.
 fn build_amp_continue_args(thread_id: &str, prompt: &str) -> Vec<String> {
     vec![
         String::from("--no-color"),
+        String::from("--dangerously-allow-all"),
         String::from("threads"),
         String::from("continue"),
         thread_id.to_string(),
@@ -601,8 +609,9 @@ fn looks_like_thread_id(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_thread_id, looks_like_thread_id, parse_amp_stream_json_line, CompletionProvider,
-        EchoProvider, ProviderError, ProviderKind, ProviderRequest,
+        build_amp_continue_args, extract_thread_id, looks_like_thread_id,
+        parse_amp_stream_json_line, CompletionProvider, EchoProvider, ProviderError, ProviderKind,
+        ProviderRequest,
     };
 
     #[test]
@@ -724,5 +733,17 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn build_amp_continue_args_includes_dangerously_allow_all() {
+        let args = build_amp_continue_args("T-00000000-0000-0000-0000-000000000000", "test prompt");
+        assert!(
+            args.contains(&String::from("--dangerously-allow-all")),
+            "amp continue args must include --dangerously-allow-all for non-interactive execution"
+        );
+        assert!(args.contains(&String::from("--stream-json")));
+        assert!(args.contains(&String::from("-x")));
+        assert!(args.contains(&String::from("test prompt")));
     }
 }

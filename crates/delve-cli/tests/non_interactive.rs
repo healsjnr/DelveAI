@@ -394,6 +394,10 @@ if [ "${1:-}" = "--no-color" ]; then
   shift
 fi
 
+if [ "${1:-}" = "--dangerously-allow-all" ]; then
+  shift
+fi
+
 if [ "${1:-}" = "threads" ] && [ "${2:-}" = "new" ]; then
   echo "Created thread T-12345678-1234-1234-1234-1234567890ab"
   exit 0

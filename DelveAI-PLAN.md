@@ -238,6 +238,24 @@ Phase exit criteria:
 2. All existing tests pass with the suggestion code removed.
 3. Auto-interactive loop functions without suggestion-driven continuation.
 
+## Phase 7.1 - Fix Amp Provider Tool Approval Error
+
+Objective: Resolve the `"The following tools require user approval, which is not supported in stream JSON mode: Bash"` error when the Amp provider's sub-agent invokes tools requiring approval.
+
+Background: The Amp CLI in `--execute --stream-json` mode cannot prompt for interactive tool approval. When the Amp sub-agent tries to use tools like `Bash` that require user confirmation, the execution fails. The Amp CLI documentation recommends using `--dangerously-allow-all` or configuring explicit permission rules for non-interactive/execute mode.
+
+Tasks:
+- [x] Add `--dangerously-allow-all` flag to `build_amp_continue_args()` in `delve-providers`.
+- [x] Add `--dangerously-allow-all` flag to the `create_thread` `threads new` invocation in `AmpProvider`.
+- [x] Update the fake amp binary in `non_interactive.rs` integration tests to accept the new flag.
+- [x] Add a unit test verifying `build_amp_continue_args` includes `--dangerously-allow-all`.
+- [x] Compile, run `make check`, verify all tests pass.
+- [x] Document the security implications in a code comment: Delve intentionally allows all tool use because it is an autonomous orchestrator and cannot handle interactive approval prompts.
+
+Phase exit criteria:
+1. Amp provider executions no longer fail due to tool approval prompts.
+2. All existing tests pass with the updated flag.
+
 ## Phase 8 - Direct Artifact Editing
 
 Objective: Allow users to edit the content of proposed artifacts before accepting or rejecting them.
@@ -448,7 +466,8 @@ Phase exit criteria:
 3. In Phase 4, provider adapters and review pipeline can split across two sub-agents.
 4. In Phase 5 and 6, interactive and non-interactive CLI work can be split once shared command core exists.
 5. Phase 7 is independent and can start immediately after Phase 6.
-6. Phases 8, 9, and 10 can run in parallel after Phase 7 completes (no cross-dependencies).
+6. Phase 7.1 is independent and can start immediately after Phase 7 or in parallel.
+7. Phases 8, 9, and 10 can run in parallel after Phase 7 completes (no cross-dependencies).
 7. Phase 15 can run in parallel with Phases 12, 13, and 14 (independent provider/orchestration work).
 8. In Phase 13 and 14, API and frontend can run in parallel after endpoint contracts are frozen.
 
